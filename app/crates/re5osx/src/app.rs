@@ -19,7 +19,7 @@ use re5osx_runtime::exit::Exit;
 use re5osx_runtime::input::{Gamepad, InputBlock, mouse};
 use re5osx_runtime::layout::is_game_dir;
 use sdl3::event::{Event, WindowEvent};
-use sdl3::keyboard::Scancode;
+use sdl3::keyboard::{Mod, Scancode};
 use sdl3::mouse::MouseButton;
 
 use crate::haptics;
@@ -227,6 +227,7 @@ pub fn run() -> Result<()> {
         friend_name: String::new(),
         capture_since: None,
         mouse_used: !MOBILE,
+        mouse_feel: MouseFeel::default(),
         ui_sounds: None,
         hold60: Default::default(),
         played_since: None,
@@ -446,6 +447,8 @@ struct App {
     capture_since: Option<Instant>,
     /// A mouse has been used in the game: phones capture it only then.
     mouse_used: bool,
+    /// The mouse as the settings shape it (speed, aim toggle).
+    mouse_feel: MouseFeel,
     /// Holds the frame rate as the Mac warms up (Settings › Hold 60 fps).
     hold60: crate::hold60::Hold60,
     /// Play time not yet added to `settings.played`, since when.
@@ -598,6 +601,23 @@ impl App {
                 return false;
             }
         }
+        // The Mac's ⌘ shortcuts are the app's, never the game's keys: ⌘,
+        // settings, ⌘Q quit, ⌃⌘F full screen.
+        if cfg!(target_os = "macos")
+            && let Event::KeyDown { scancode: Some(sc), keymod, repeat, .. } = event
+            && keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD)
+        {
+            match sc {
+                Scancode::Comma if !repeat => self.ui.toggle_settings(),
+                Scancode::Q => return true,
+                Scancode::F if !repeat && keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) => {
+                    let full = self.window.fullscreen_state() != sdl3::video::FullscreenType::Off;
+                    let _ = self.window.set_fullscreen(!full);
+                }
+                _ => {}
+            }
+            return false;
+        }
         if let Event::KeyDown { scancode: Some(Scancode::F1), repeat: false, .. } = event {
             self.ui.toggle_settings();
             return false;
@@ -636,7 +656,8 @@ impl App {
         if let Some(game) = &self.game
             && let Some(input) = &game.input
         {
-            game_input(input, &event, &self.window, game.back_buffer);
+            let captured = self.mouse.relative_mouse_mode(&self.window);
+            game_input(input, &event, &self.window, game.back_buffer, &self.settings, &mut self.mouse_feel, captured);
         }
         false
     }
@@ -985,7 +1006,12 @@ impl App {
         if captured != capture && (capture || !want) {
             self.mouse.set_relative_mouse_mode(&self.window, capture);
             input.pointer_locked(capture);
+            // Out of the game's camera (a menu, another app): a toggled aim lets go.
+            if !capture {
+                self.mouse_feel.release(&input);
+            }
         }
+        self.mouse_feel.tick(&input);
         let shown = ours || !game_cursor;
         if self.mouse.is_cursor_showing() != shown {
             self.mouse.show_cursor(shown);
@@ -1676,15 +1702,101 @@ fn upscaler(settings: &Settings) -> Upscaler {
 /// The upscalers, as the settings offer them.
 const UPSCALERS: &[Upscaling] = &[Upscaling::Bicubic, Upscaling::MetalFx, Upscaling::MetalFxTemporal, Upscaling::Fsr];
 
-/// Keyboard and mouse into the game's input block.
+/// A Caps Lock press as the game gets it: held this long, so that a frame
+/// sees it down.
+const CAPS_TAP: Duration = Duration::from_millis(80);
+
+/// The mouse and keys as the settings and the Mac shape them, between events.
+#[derive(Default)]
+struct MouseFeel {
+    /// What the speed left of a move's fraction of a pixel, for the next one.
+    carry: (f32, f32),
+    /// Aiming, with the aim toggle on.
+    aiming: bool,
+    /// Caps Lock's lock as last seen, and when the tap it made lets go.
+    caps_lock: Option<bool>,
+    caps_up_at: Option<Instant>,
+}
+
+impl MouseFeel {
+    /// A move, scaled: whole pixels now, the fraction carried.
+    fn scale(&mut self, dx: f32, dy: f32, speed: f32) -> (i32, i32) {
+        let x = dx * speed + self.carry.0;
+        let y = dy * speed + self.carry.1;
+        let (ix, iy) = (x.trunc(), y.trunc());
+        self.carry = (x - ix, y - iy);
+        (ix as i32, iy as i32)
+    }
+
+    fn release(&mut self, input: &InputBlock) {
+        if self.aiming {
+            self.aiming = false;
+            input.mouse_button(mouse::RIGHT, false);
+        }
+    }
+
+    /// Caps Lock on a Mac is a lock, not a key: macOS reports each change
+    /// as a press and release together, too quick for the game to see. Each
+    /// change becomes one press, held for [`CAPS_TAP`] (the special ability
+    /// is Caps Lock on PC).
+    fn caps_lock(&mut self, input: &InputBlock, locked: bool) {
+        if self.caps_lock == Some(locked) {
+            return;
+        }
+        self.caps_lock = Some(locked);
+        input.key(0x14, true);
+        self.caps_up_at = Some(Instant::now() + CAPS_TAP);
+    }
+
+    /// Every frame: lets go of a Caps Lock tap once it has been held.
+    fn tick(&mut self, input: &InputBlock) {
+        if self.caps_up_at.is_some_and(|t| Instant::now() >= t) {
+            self.caps_up_at = None;
+            input.key(0x14, false);
+        }
+    }
+}
+
+/// Keyboard and mouse into the game's input block. `captured`: the mouse
+/// turns the game's camera (relative mode), where the mouse settings apply;
+/// over the game's menus it is its cursor, as it is.
 fn game_input(
     input: &InputBlock,
     event: &Event,
     window: &sdl3::video::Window,
     back_buffer: (u32, u32),
+    settings: &Settings,
+    feel: &mut MouseFeel,
+    captured: bool,
 ) {
     let (bw, bh) = (back_buffer.0 as f32, back_buffer.1 as f32);
     match *event {
+        // ⌘ is the app's (its shortcuts), not a key of the game's.
+        Event::KeyDown { scancode: Some(Scancode::LGui | Scancode::RGui), .. }
+        | Event::KeyUp { scancode: Some(Scancode::LGui | Scancode::RGui), .. }
+            if cfg!(target_os = "macos") => {}
+        Event::KeyDown { scancode: Some(sc), keymod, repeat, .. } | Event::KeyUp { scancode: Some(sc), keymod, repeat, .. }
+            if let Some(target) = keymap::remapped(sc, &settings.key_remaps) =>
+        {
+            // Caps Lock stays down until pressed again: its state is the lock's.
+            let down = if sc == Scancode::CapsLock {
+                keymod.contains(Mod::CAPSMOD)
+            } else {
+                matches!(event, Event::KeyDown { .. })
+            };
+            if !repeat {
+                match target {
+                    keymap::Target::Key(vk) => input.key(vk, down),
+                    keymap::Target::Mouse(button) => input.mouse_button(button, down),
+                }
+            }
+        }
+        Event::KeyDown { scancode: Some(Scancode::CapsLock), keymod, .. }
+        | Event::KeyUp { scancode: Some(Scancode::CapsLock), keymod, .. }
+            if cfg!(target_os = "macos") =>
+        {
+            feel.caps_lock(input, keymod.contains(Mod::CAPSMOD))
+        }
         Event::KeyDown { scancode: Some(sc), repeat, .. } => {
             if !repeat {
                 key(input, sc, true);
@@ -1700,8 +1812,18 @@ fn game_input(
         Event::MouseMotion { x, y, xrel, yrel, .. } => {
             let (ww, wh) = window.size();
             input.mouse_position((x * bw / ww as f32) as i32, (y * bh / wh as f32) as i32);
-            input.mouse_motion(xrel.round() as i32, yrel.round() as i32);
+            let (dx, dy) = if captured {
+                feel.scale(xrel, yrel, settings.mouse_speed)
+            } else {
+                (xrel.round() as i32, yrel.round() as i32)
+            };
+            input.mouse_motion(dx, dy);
         }
+        Event::MouseButtonDown { mouse_btn: MouseButton::Right, .. } if settings.aim_toggle && captured => {
+            feel.aiming = !feel.aiming;
+            input.mouse_button(mouse::RIGHT, feel.aiming);
+        }
+        Event::MouseButtonUp { mouse_btn: MouseButton::Right, .. } if settings.aim_toggle && captured => {}
         Event::MouseButtonDown { mouse_btn, .. } => input.mouse_button(mouse_bit(mouse_btn), true),
         Event::MouseButtonUp { mouse_btn, .. } => input.mouse_button(mouse_bit(mouse_btn), false),
         Event::MouseWheel { y, .. } => input.mouse_wheel(y.round() as i32),
@@ -1737,7 +1859,7 @@ fn key(input: &InputBlock, sc: sdl3::keyboard::Scancode, down: bool) {
             input.key(generic, down);
         }
     }
-    if let Some(alias) = keymap::numpad_alias(sc) {
+    for &alias in keymap::numpad_alias(sc) {
         input.key(alias, down);
     }
 }

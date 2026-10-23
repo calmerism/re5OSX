@@ -59,6 +59,16 @@ pub struct Settings {
     /// The aim assist while playing by touch (the game's Targeting Mode,
     /// in place of its menu's).
     pub touch_aim: TouchAim,
+    /// Mouse and trackpad: how far the camera turns for a move, as a
+    /// multiple of the move (the game's own sensitivity applies on top).
+    pub mouse_speed: f32,
+    /// A right click (two fingers on a trackpad) starts aiming and the next
+    /// one stops it, instead of holding the button: a trackpad cannot hold
+    /// a right click while it clicks to shoot.
+    pub aim_toggle: bool,
+    /// Mac keys standing in for others (Settings › Controls › Keys): keys
+    /// MacBooks lack, aiming on a key, the player's own bindings.
+    pub key_remaps: Vec<crate::keymap::Remap>,
     /// The Taptic Engine taps under pressed touch controls and plays the game's rumble (iPhone).
     pub haptics: bool,
     /// The game starts in the sandbox (the map, no story) rather than the
@@ -236,6 +246,9 @@ impl Default for Settings {
             touch_size: 1.0,
             touch_camera: 1.0,
             touch_aim: TouchAim::LockOn,
+            mouse_speed: 1.0,
+            aim_toggle: false,
+            key_remaps: crate::keymap::default_remaps(),
             haptics: true,
             sandbox: false,
             online: false,

@@ -42,16 +42,150 @@ pub fn generic(vk: u8) -> Option<u8> {
     }
 }
 
-/// Like the browser page: I/K/J/L/U/O also press numpad 8/2/4/6/7/9 (flight
-/// controls on keyboards without a numpad).
-pub fn numpad_alias(sc: Sc) -> Option<u8> {
-    Some(match sc {
-        Sc::I => 0x68,
-        Sc::K => 0x62,
-        Sc::J => 0x64,
-        Sc::L => 0x66,
-        Sc::U => 0x67,
-        Sc::O => 0x69,
-        _ => return None,
-    })
+/// Like the browser page: I/K/J/L/U/O also press numpad 8/2/4/6/7/9, the
+/// aircraft's pitch, roll and targeting, on keyboards without a numpad
+/// (every MacBook). K presses numpad 5 too, pitch back in PC GTA V's own
+/// bindings.
+pub fn numpad_alias(sc: Sc) -> &'static [u8] {
+    match sc {
+        Sc::I => &[0x68],
+        Sc::K => &[0x62, 0x65],
+        Sc::J => &[0x64],
+        Sc::L => &[0x66],
+        Sc::U => &[0x67],
+        Sc::O => &[0x69],
+        _ => &[],
+    }
 }
+
+/// What a key can press in the game instead of its own: a key (a Windows
+/// virtual-key code) or a mouse button (`re5osx_runtime::input::mouse`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Key(u8),
+    Mouse(u32),
+}
+
+/// A key standing in for another, as Settings › Controls keeps it: by the
+/// names in [`mac_keys`] and [`game_keys`], so the settings file reads
+/// plainly.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Remap {
+    pub from: String,
+    pub to: String,
+}
+
+impl Remap {
+    pub fn new(from: &str, to: &str) -> Remap {
+        Remap { from: from.into(), to: to.into() }
+    }
+}
+
+/// The remaps a new player starts with: none. Every key does what it does
+/// on PC (Caps Lock is the special ability); aiming on a trackpad is the
+/// aim toggle's.
+pub fn default_remaps() -> Vec<Remap> {
+    Vec::new()
+}
+
+/// The keys a Mac keyboard has that can stand in for another (not ⌘: its
+/// shortcuts are the app's).
+pub fn mac_keys() -> Vec<(String, Sc)> {
+    let mut keys: Vec<(String, Sc)> = [
+        ("Caps Lock", Sc::CapsLock),
+        ("Tab", Sc::Tab),
+        ("`", Sc::Grave),
+        ("Left Option", Sc::LAlt),
+        ("Right Option", Sc::RAlt),
+        ("Left Control", Sc::LCtrl),
+        ("Right Shift", Sc::RShift),
+        ("Return", Sc::Return),
+        ("Space", Sc::Space),
+        ("Left Arrow", Sc::Left),
+        ("Right Arrow", Sc::Right),
+        ("Up Arrow", Sc::Up),
+        ("Down Arrow", Sc::Down),
+        ("-", Sc::Minus),
+        ("=", Sc::Equals),
+        ("[", Sc::LeftBracket),
+        ("]", Sc::RightBracket),
+        ("\\", Sc::Backslash),
+        (";", Sc::Semicolon),
+        ("'", Sc::Apostrophe),
+        (",", Sc::Comma),
+        (".", Sc::Period),
+        ("/", Sc::Slash),
+    ]
+    .map(|(n, s)| (n.to_string(), s))
+    .into();
+    keys.extend(LETTERS.iter().map(|&(c, sc)| (c.to_string(), sc)));
+    keys.extend(DIGITS.iter().map(|&(c, sc)| (c.to_string(), sc)));
+    keys.extend(FUNCTION.iter().enumerate().map(|(i, &sc)| (format!("F{}", i + 1), sc)));
+    keys
+}
+
+/// What a Mac key can press in the game: the mouse's buttons, the keys
+/// MacBooks lack (numpad, Insert, Home, Page Up...), and every other key.
+pub fn game_keys() -> Vec<(String, Target)> {
+    use re5osx_runtime::input::mouse;
+    let mut keys: Vec<(String, Target)> = vec![
+        ("Aim (right mouse)".into(), Target::Mouse(mouse::RIGHT)),
+        ("Shoot (left mouse)".into(), Target::Mouse(mouse::LEFT)),
+        ("Middle mouse".into(), Target::Mouse(mouse::MIDDLE)),
+    ];
+    keys.extend((0..10).map(|n| (format!("Numpad {n}"), Target::Key(0x60 + n))));
+    keys.extend(
+        [
+            ("Numpad +", 0x6B),
+            ("Numpad -", 0x6D),
+            ("Numpad *", 0x6A),
+            ("Numpad /", 0x6F),
+            ("Numpad .", 0x6E),
+            ("Insert", 0x2D),
+            ("Delete", 0x2E),
+            ("Home", 0x24),
+            ("End", 0x23),
+            ("Page Up", 0x21),
+            ("Page Down", 0x22),
+            ("Left Alt", 0xA4),
+            ("Left Control", 0xA2),
+            ("Left Shift", 0xA0),
+            ("Space", 0x20),
+            ("Tab", 0x09),
+            ("Enter", 0x0D),
+            ("Escape", 0x1B),
+            ("Backspace", 0x08),
+            ("Left Arrow", 0x25),
+            ("Right Arrow", 0x27),
+            ("Up Arrow", 0x26),
+            ("Down Arrow", 0x28),
+        ]
+        .map(|(n, vk)| (n.to_string(), Target::Key(vk))),
+    );
+    keys.extend(LETTERS.iter().map(|&(c, _)| (c.to_string(), Target::Key(c as u8))));
+    keys.extend(DIGITS.iter().map(|&(c, _)| (c.to_string(), Target::Key(c as u8))));
+    keys.extend((0..12).map(|i| (format!("F{}", i + 1), Target::Key(0x70 + i as u8))));
+    keys
+}
+
+/// What `sc` presses in the game under `remaps`, if anything stands in for it.
+pub fn remapped(sc: Sc, remaps: &[Remap]) -> Option<Target> {
+    let from = mac_keys().into_iter().find(|&(_, s)| s == sc)?.0;
+    let to = &remaps.iter().find(|r| r.from == from)?.to;
+    game_keys().into_iter().find(|(n, _)| n == to).map(|(_, t)| t)
+}
+
+const LETTERS: [(char, Sc); 26] = [
+    ('A', Sc::A), ('B', Sc::B), ('C', Sc::C), ('D', Sc::D), ('E', Sc::E), ('F', Sc::F), ('G', Sc::G),
+    ('H', Sc::H), ('I', Sc::I), ('J', Sc::J), ('K', Sc::K), ('L', Sc::L), ('M', Sc::M), ('N', Sc::N),
+    ('O', Sc::O), ('P', Sc::P), ('Q', Sc::Q), ('R', Sc::R), ('S', Sc::S), ('T', Sc::T), ('U', Sc::U),
+    ('V', Sc::V), ('W', Sc::W), ('X', Sc::X), ('Y', Sc::Y), ('Z', Sc::Z),
+];
+
+const DIGITS: [(char, Sc); 10] = [
+    ('1', Sc::_1), ('2', Sc::_2), ('3', Sc::_3), ('4', Sc::_4), ('5', Sc::_5),
+    ('6', Sc::_6), ('7', Sc::_7), ('8', Sc::_8), ('9', Sc::_9), ('0', Sc::_0),
+];
+
+const FUNCTION: [Sc; 12] =
+    [Sc::F1, Sc::F2, Sc::F3, Sc::F4, Sc::F5, Sc::F6, Sc::F7, Sc::F8, Sc::F9, Sc::F10, Sc::F11, Sc::F12];

@@ -1,0 +1,8 @@
+{
+  "name": "Trainer",
+  "description": "A Story mode trainer: god mode, no police, weapons, infinite ammo, vehicles, time, weather and teleporting to your map marker. Open it with F7.",
+  "author": "re5OSX",
+  "version": "1.0",
+  "autostart": true,
+  "restartOnSave": true
+}

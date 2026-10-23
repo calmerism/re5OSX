@@ -16,6 +16,11 @@ served by the app to your browser, on the same Mac or on another computer.
 3. Start a game. Mods marked to start with the game run once you are in;
    the others start from the Mods page or the Studio.
 
+For an example, copy [`mods/trainer`](../mods/trainer) from this
+repository into the mods folder: a Story mode trainer (god mode, no police,
+weapons, vehicles, time, weather, teleporting to the map marker) that opens
+with F7.
+
 Mods with a menu show it on the Mods page's **MENUS** (F7), drawn by the
 app: it works with controllers, keyboard and mouse.
 

@@ -1069,15 +1069,9 @@ pub(super) fn settings_page(
 ) -> bool {
     sheet(ctx, "settings-window", "", |ui| {
         let scale = theme::density(ui);
-        // Controls holds only the touch screen's settings: on a computer there is nothing to show.
-        let tabs: &[(SettingsTab, &str)] = if TOUCH {
-            &[(SettingsTab::Video, "VIDEO"), (SettingsTab::Controls, "CONTROLS"), (SettingsTab::Game, "GAME")]
-        } else {
-            &[(SettingsTab::Video, "VIDEO"), (SettingsTab::Game, "GAME")]
-        };
-        if !TOUCH && *tab == SettingsTab::Controls {
-            *tab = SettingsTab::Game;
-        }
+        // Controls: the mouse's settings on a computer, the touch screen's on a phone or tablet.
+        let tabs: &[(SettingsTab, &str)] =
+            &[(SettingsTab::Video, "VIDEO"), (SettingsTab::Controls, "CONTROLS"), (SettingsTab::Game, "GAME")];
         segmented(ui, tab, tabs, 40.0 * scale);
         ui.add_space(10.0 * scale);
         if let Some(note) = note {
@@ -1262,6 +1256,22 @@ fn settings_items(
             }
         }
         SettingsTab::Controls => {
+            if !MOBILE {
+                setting(ui, "Mouse speed", Control::Slider, None, |ui| {
+                    slider(ui, &mut settings.mouse_speed, 0.25..=6.0, 0.05, "×", 2)
+                })
+                .on_hover_text("How fast the mouse or trackpad turns the camera. The game's own sensitivity applies on top");
+                setting(ui, "Aim toggle", Control::Toggle, None, |ui| toggle(ui, &mut settings.aim_toggle)).on_hover_text(
+                    "A right click (two fingers on a trackpad) starts aiming and the next one stops it, so you can click to \
+                     shoot while aiming",
+                );
+            }
+            if !MOBILE {
+                keys(ui, &mut settings.key_remaps);
+            }
+            if !TOUCH {
+                return;
+            }
             setting(ui, "Touch controls", Control::Choice, None, |ui| {
                 choice(
                     ui,
@@ -1857,4 +1867,47 @@ mod tests {
         .clear();
         assert!(matches!(actions[..], [crate::ui::Action::FindServers]));
     }
+}
+
+/// Settings › Controls › Keys: Mac keys standing in for others, a row each
+/// (the Mac key, what it presses in the game, ✕), then Add and Reset.
+fn keys(ui: &mut egui::Ui, remaps: &mut Vec<crate::keymap::Remap>) {
+    use crate::keymap::{self, Remap};
+    let (mac, game) = (keymap::mac_keys(), keymap::game_keys());
+    let mut remove = None;
+    for (i, remap) in remaps.iter_mut().enumerate() {
+        setting(ui, &format!("Key {}", i + 1), Control::Actions, None, |ui| {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt(("key-from", i)).selected_text(&remap.from).width(110.0).show_ui(ui, |ui| {
+                    for (name, _) in &mac {
+                        ui.selectable_value(&mut remap.from, name.clone(), name);
+                    }
+                });
+                ui.label("→");
+                egui::ComboBox::from_id_salt(("key-to", i)).selected_text(&remap.to).width(140.0).show_ui(ui, |ui| {
+                    for (name, _) in &game {
+                        ui.selectable_value(&mut remap.to, name.clone(), name);
+                    }
+                });
+                if ui.button("✕").on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                }
+            })
+            .response
+        });
+    }
+    if let Some(i) = remove {
+        remaps.remove(i);
+    }
+    let summary = "A Mac key presses another in the game: keys MacBooks lack (numpad, Insert, Page Up), or aim on a key";
+    setting(ui, "Keys", Control::Actions, Some(summary), |ui| {
+        let r = super::widgets::action_buttons(ui, &["Add", "Reset"]);
+        if r[0].clicked() {
+            remaps.push(Remap::new("Right Option", "Numpad 5"));
+        }
+        if r[1].clicked() {
+            *remaps = keymap::default_remaps();
+        }
+        r[0].clone()
+    });
 }
