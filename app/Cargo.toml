@@ -8,7 +8,7 @@ exclude = ["third_party", "crates/re5osx-studio"]
 default-members = ["crates/re5osx"]
 
 [workspace.package]
-version = "0.1.0"
+version = "2026.10.0"
 edition = "2024"
 rust-version = "1.90"
 license = "GPL-3.0-or-later"

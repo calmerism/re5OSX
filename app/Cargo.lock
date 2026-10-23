@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-app"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "re5osx",
  "re5osx-runtime",
@@ -3087,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-game"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-gamec"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-gpu"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -3140,7 +3140,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-launcher"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -3155,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-mods"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -3175,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-qos"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "libc",
  "log",
@@ -3183,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-runtime"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "anyhow",
  "blake2",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "re5osx-stream"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "anyhow",
  "crc32fast",

@@ -42,7 +42,10 @@ cp -R third_party/wabt/third_party/simde/simde "$kit/third_party/wabt/third_part
 cp "$target"/re5osx-tools/wabt-src/wasm2c/*.{c,h,inc} "$kit/wabt-src/wasm2c/"
 cp "$assets/re5OSX.icns" "$assets/Assets.car" "$kit/"
 # re5OSX's Info.plist: cargo-packager's keys and platform/macos/Info.plist's.
+# The workspace's version (Cargo wants three numbers), as the app shows it:
+# 2026.10.0 is 2026.10.
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+version=${version%.0}
 sed -e "s/@VERSION@/$version/g" platform/macos/native.plist > "$kit/Info.plist"
 
 # The launcher.
