@@ -1,0 +1,3 @@
+# Nested generic types read fine here (caches keyed by tuples, slots of
+# Arc<OnceLock<..>>): no aliases just for the lint.
+type-complexity-threshold = 1000

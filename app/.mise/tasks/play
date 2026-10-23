@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Build and play the game (desktop)"
+#MISE depends=["setup"]
+#USAGE arg "[args]..." var=#true help="Passed on to the game (e.g. --play, a game directory)"
+exec cargo run -r -- "$@"

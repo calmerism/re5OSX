@@ -1,0 +1,40 @@
+From 687458d7c755c3a778002c1073507271ab724a7f Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 21:54:05 +0200
+Subject: [PATCH] sp-fidelity: FSR 2's accumulate pass through whole variables
+
+InitParams passed ComputeReprojectedUVs pointers to two members of its
+local struct. SPIR-V's logical addressing (Vulkan's) lets a function
+call take pointers only to whole variables, and naga's SPIR-V writer,
+which defers a pointer's access chain until it is dereferenced, panics
+on one passed as an argument ("Expression [27] is not cached!"): FSR 2
+could not be made on Vulkan. Metal takes such pointers, so macOS and
+iOS were not affected. The call goes through two local variables, whose
+values are then stored in the struct.
+
+---
+ shaders/wgsl/fsr2/ffx_fsr2_accumulate.wgsl | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/shaders/wgsl/fsr2/ffx_fsr2_accumulate.wgsl b/shaders/wgsl/fsr2/ffx_fsr2_accumulate.wgsl
+index 56c45ee..ab50204 100644
+--- a/shaders/wgsl/fsr2/ffx_fsr2_accumulate.wgsl
++++ b/shaders/wgsl/fsr2/ffx_fsr2_accumulate.wgsl
+@@ -246,7 +246,13 @@ fn InitParams(iPxHrPos: FfxInt32x2) -> AccumulationPassCommonParams
+     params.fMotionVector = GetMotionVector(iPxHrPos, fHrUv);
+     params.fHrVelocity = GetPxHrVelocity_f32x2(params.fMotionVector);
+ 
+-    ComputeReprojectedUVs(params, &params.fReprojectedHrUv, &params.bIsExistingSample);
++    // Through whole variables: SPIR-V's logical addressing passes a function
++    // no pointer into a struct (and naga's SPIR-V writer panics on one).
++    var fReprojectedHrUv: FfxFloat32x2;
++    var bIsExistingSample: FfxBoolean;
++    ComputeReprojectedUVs(params, &fReprojectedHrUv, &bIsExistingSample);
++    params.fReprojectedHrUv = fReprojectedHrUv;
++    params.bIsExistingSample = bIsExistingSample;
+ 
+     params.fDepthClipFactor = ffxSaturate_f32(SampleDepthClip(params.fLrUv_HwSampler));
+ 
+-- 
+2.55.0.windows.2
+

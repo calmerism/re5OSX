@@ -1,0 +1,97 @@
+From aba41ef1a8f1d024700f92d3329943ff3bd3e20c Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 17:05:52 +0200
+Subject: [PATCH] wgpu: RenderPass::set_depth_bias
+
+Sets the depth bias of the triangles drawn with a depth-stencil
+attachment from then on in the pass, in place of their pipelines'
+DepthStencilState::bias (wgpu-core's render_pass_set_depth_bias):
+pipelines that differ only in their depth bias can be one, as with
+Vulkan's dynamic depth bias. Not part of WebGPU (the web backend has no
+such call); not implemented on D3D12.
+
+---
+ src/api/render_pass.rs   | 11 +++++++++++
+ src/backend/webgpu.rs    |  4 ++++
+ src/backend/wgpu_core.rs | 15 +++++++++++++++
+ src/dispatch.rs          |  1 +
+ 4 files changed, 31 insertions(+)
+
+diff --git a/src/api/render_pass.rs b/src/api/render_pass.rs
+index 719cbbd..3418fcd 100644
+--- a/src/api/render_pass.rs
++++ b/src/api/render_pass.rs
+@@ -179,6 +179,17 @@ impl RenderPass<'_> {
+         self.inner.set_stencil_reference(reference);
+     }
+ 
++    /// Sets the depth bias of the triangles drawn with a depth-stencil
++    /// attachment from now on in this pass, in place of their pipelines'
++    /// [`DepthStencilState::bias`]: pipelines that differ only in their
++    /// depth bias can be one (as with Vulkan's dynamic depth bias, or the
++    /// depth bias Metal sets on the encoder).
++    ///
++    /// Not part of WebGPU; not implemented on DX12 (the pipelines' own stay).
++    pub fn set_depth_bias(&mut self, bias: DepthBiasState) {
++        self.inner.set_depth_bias(bias);
++    }
++
+     /// Inserts debug marker.
+     pub fn insert_debug_marker(&mut self, label: &str) {
+         self.inner.insert_debug_marker(label);
+diff --git a/src/backend/webgpu.rs b/src/backend/webgpu.rs
+index 870e98a..0bffc84 100644
+--- a/src/backend/webgpu.rs
++++ b/src/backend/webgpu.rs
+@@ -3669,6 +3669,10 @@ impl dispatch::RenderPassInterface for WebRenderPassEncoder {
+         self.inner.set_stencil_reference(reference);
+     }
+ 
++    fn set_depth_bias(&mut self, _bias: crate::DepthBiasState) {
++        unimplemented!("WebGPU has no dynamic depth bias")
++    }
++
+     fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+         self.inner
+             .draw_with_instance_count_and_first_vertex_and_first_instance(
+diff --git a/src/backend/wgpu_core.rs b/src/backend/wgpu_core.rs
+index 0494b96..8917cf3 100644
+--- a/src/backend/wgpu_core.rs
++++ b/src/backend/wgpu_core.rs
+@@ -3357,6 +3357,21 @@ impl dispatch::RenderPassInterface for CoreRenderPass {
+         }
+     }
+ 
++    fn set_depth_bias(&mut self, bias: crate::DepthBiasState) {
++        if let Err(cause) = self
++            .context
++            .0
++            .render_pass_set_depth_bias(&mut self.pass, bias)
++        {
++            self.context.handle_error(
++                &self.error_sink,
++                cause,
++                self.pass.label(),
++                "RenderPass::set_depth_bias",
++            );
++        }
++    }
++
+     fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+         if let Err(cause) = self.context.0.render_pass_draw(
+             &mut self.pass,
+diff --git a/src/dispatch.rs b/src/dispatch.rs
+index c16675c..4ee5860 100644
+--- a/src/dispatch.rs
++++ b/src/dispatch.rs
+@@ -457,6 +457,7 @@ pub trait RenderPassInterface: CommonTraits + Drop {
+         max_depth: f32,
+     );
+     fn set_stencil_reference(&mut self, reference: u32);
++    fn set_depth_bias(&mut self, bias: crate::DepthBiasState);
+ 
+     fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>);
+     fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>);
+-- 
+2.50.1 (Apple Git-155)
+

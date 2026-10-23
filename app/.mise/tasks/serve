@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+#MISE description="Serve the game folder to the app on other devices (streaming; -- --help lists the options)"
+#USAGE arg "[args]..." var=#true help="Passed on to re5osx-serve (e.g. --port, --rate, a game folder)"
+exec cargo run -r -p re5osx-stream --bin re5osx-serve -- "$@"

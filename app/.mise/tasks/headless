@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run without a window: scripted input, PNG shots, statistics (-- --help lists the options)"
+#MISE depends=["setup"]
+#USAGE arg "[args]..." var=#true help="Passed on to the headless runner"
+exec cargo run -r --example headless -- "$@"

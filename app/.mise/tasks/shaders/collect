@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#MISE description="Record pipeline recipes on automated runs (benchmark, map tours) at the graphics settings' levels, into the app's seed"
+#MISE depends=["setup"]
+#USAGE arg "[levels]..." var=#true help="default low min mid high max (all when none)"
+set -euo pipefail
+# Every pipeline the game makes has to be compiled before it draws: those
+# known in advance (the seed) compile before the game starts, the others
+# while playing, their draws missing meanwhile. This finds them without
+# anyone playing: headless runs, every frame drawn (--sync-pipelines), at
+# levels of the graphics settings. Recipes are the same on every device
+# (`Recipe::for_device`): collected here, they serve phones too.
+#
+# At each level the game's benchmark (a fly-through of the map with a car
+# chase: shooting, glass, particles) and a tour of the map
+# (crates/re5osx/examples/tour.txt: interiors, places at hours and in
+# weathers; the phone and the map on the way). The two shader qualities
+# the game runs (default, max) also tour a grid over the whole map, a stop
+# every 400 m (the sea skipped): what the world draws depends on the place
+# more than on the other settings. About 80 minutes for all.
+
+# Seconds at each stop: the scene loads before the stay begins; longer
+# stays only meet more passers-by.
+stay=3
+tour=crates/re5osx/examples/tour.txt
+out="${TMPDIR:-/tmp/}"
+out="${out%/}/re5osx-collect"
+export RE5OSX_GAME_DIR="${RE5OSX_GAME_DIR:-$PWD/game}"
+
+cargo build -r --example headless
+exe=target/release/examples/headless
+
+# The levels, as settings.xml values: between them every value of each
+# setting. Shader quality starts at High (1): Normal runs as High (the
+# game's shaders lack its variants, see crates/re5osx-runtime/src/shader_settings.rs). Density and
+# distance stay as they are: more of the same pipelines, gigabytes more
+# memory.
+switches="FXAA_Enabled Lighting_FogVolumes DoF Shadow_ParticleShadows Shadow_LongShadows UltraShadows_Enabled"
+level() {
+    local on=$1
+    shift
+    echo "$@"
+    for s in $switches; do echo "$s=$on"; done
+}
+min=$(level false ShaderQuality=1 ShadowQuality=1 ReflectionQuality=0 SSAO=0 ParticleQuality=0 WaterQuality=0 \
+    GrassQuality=0 PostFX=0 Shadow_SoftShadows=0 MotionBlurStrength=0.000000 Reflection_MipBlur=false)
+mid=$(level false ShaderQuality=1 ShadowQuality=2 ReflectionQuality=1 SSAO=1 ParticleQuality=1 WaterQuality=1 \
+    GrassQuality=1 PostFX=1 Shadow_SoftShadows=2 MotionBlurStrength=0.000000 Reflection_MipBlur=true)
+high=$(level true ShaderQuality=1 ShadowQuality=3 ReflectionQuality=2 SSAO=2 ParticleQuality=2 WaterQuality=2 \
+    GrassQuality=2 PostFX=2 Shadow_SoftShadows=3 MotionBlurStrength=0.500000 Reflection_MipBlur=true)
+max=$(level true ShaderQuality=2 ShadowQuality=3 ReflectionQuality=3 SSAO=2 ParticleQuality=2 WaterQuality=2 \
+    GrassQuality=3 PostFX=3 Shadow_SoftShadows=5 MotionBlurStrength=1.000000 Reflection_MipBlur=true)
+
+# One run: level, what (bench, tour or world: the tour and the grid), then
+# headless options. Prints a line when done.
+run() {
+    local name=$1 kind=$2 dir="$out/$1-$2"
+    shift 2
+    local args=("$@")
+    mkdir -p "$dir"
+    case $kind in
+        bench)
+            # It ends by itself, after ~200 s on an idle Mac.
+            args+=(--benchmark --for 900)
+            ;;
+        tour | world)
+            cp "$tour" "$dir/tour.txt"
+            if [ "$kind" = world ]; then
+                # The grid, its stops on the ground, hours and weathers by turns.
+                awk 'BEGIN {
+                    split("7 12 17 21 1", hour, " ")
+                    split("EXTRASUNNY CLEAR CLOUDS RAIN FOGGY SMOG OVERCAST THUNDER", weather, " ")
+                    for (x = -3600; x <= 4000; x += 400)
+                        for (y = -3800; y <= 7800; y += 400)
+                            printf "%d %d ground %d %s\n", x, y, hour[n % 5 + 1], weather[n++ % 8 + 1]
+                }' >>"$dir/tour.txt"
+            fi
+            local stops
+            stops=$(grep -cvE '^[[:space:]]*(#|$)' "$dir/tour.txt")
+            args+=(--sandbox --tour "$dir/tour.txt" "$stay" --for $((stops * stay * 2 + 300)))
+            # On the way, the phone (up; B closes it) and the map (START
+            # opens the pause menu on it; B closes it).
+            args+=(--press 45 up --press 52 east --press 60 start --press 75 east --press 77 east)
+            ;;
+    esac
+    local t0=$SECONDS status=0 n=0
+    "$exe" --sync-pipelines --user-dir "$dir" "${args[@]}" >"$dir/log.txt" 2>&1 ||
+        status=$?
+    [ -f "$dir/cache/pipelines.jsonl" ] && n=$(wc -l <"$dir/cache/pipelines.jsonl" | tr -d ' ')
+    printf '%-14s %5d s  %5d new recipes%s\n' "$name $kind" $((SECONDS - t0)) "$n" \
+        "$([ $status = 0 ] || echo "  FAILED (exit $status, $dir/log.txt)")"
+}
+
+# A level's settings as headless options.
+settings() { for s in "$@"; do echo "--setting $s"; done; }
+
+levels=("$@")
+[ ${#levels[@]} = 0 ] && levels=(default low min mid high max)
+echo "runs in $out"
+rm -rf "$out"
+# shellcheck disable=SC2046,SC2086 # the settings' words are options
+for l in "${levels[@]}"; do
+    case $l in
+        default) run default bench && run default world ;;
+        low) run low bench --low && run low tour --low ;;
+        min | mid | high) run "$l" bench $(settings ${!l}) && run "$l" tour $(settings ${!l}) ;;
+        max) run max bench $(settings $max) && run max world $(settings $max) ;;
+        *) echo "unknown level $l" >&2 && exit 1 ;;
+    esac
+done
+recorded=("$out"/*/cache/pipelines.jsonl)
+if [ -e "${recorded[0]}" ]; then
+    .mise/tasks/shaders/seed "${recorded[@]}"
+fi

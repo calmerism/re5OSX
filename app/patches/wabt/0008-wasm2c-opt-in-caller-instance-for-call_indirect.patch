@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Wed, 14 Oct 2026 16:10:00 +0200
+Subject: [PATCH] wasm2c: opt-in caller instance for call_indirect
+
+WASM_RT_NONCONFORMING_CALLER_INSTANCE: call_indirect passes the calling
+function's instance, not the one stored in the table entry. A program
+that runs one instance of the same module per thread (wasm threads over a
+shared memory) can then give every instance one shared table instead of a
+copy each; the copies differ only in the instance their entries hold. For
+a module with ~90k table entries this is ~2.9 MB per thread.
+---
+ src/template/wasm2c.declarations.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/template/wasm2c.declarations.c b/src/template/wasm2c.declarations.c
+--- a/src/template/wasm2c.declarations.c
++++ b/src/template/wasm2c.declarations.c
+@@ -126,7 +126,17 @@
+   (LIKELY((x) < table.size && ft == table.data[x].func_type) || \
+    func_types_eq_slowpath(&(table), ft, x))
+ 
++// WASM_RT_NONCONFORMING_CALLER_INSTANCE: call_indirect passes the calling
++// function's instance instead of the one the table entry holds, so that the
++// instances of one module (one per thread) can share a single table. Only for
++// trusted modules whose tables hold nothing but their own functions, and host
++// functions that take the caller's instance.
++#if WASM_RT_NONCONFORMING_CALLER_INSTANCE
++#define DO_CALL_INDIRECT(table, t, x, entry_instance, ...) \
++  ((t)table.data[x].func)(instance, ##__VA_ARGS__)
++#else
+ #define DO_CALL_INDIRECT(table, t, x, ...) ((t)table.data[x].func)(__VA_ARGS__)
++#endif
+ 
+ // WASM_RT_NONCONFORMING_UNCHECKED_CALL_INDIRECT skips the table bounds and
+ // signature checks of call_indirect. Only for trusted modules.
+-- 
+2.50.1

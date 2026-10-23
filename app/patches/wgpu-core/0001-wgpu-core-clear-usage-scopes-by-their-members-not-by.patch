@@ -1,0 +1,106 @@
+From 98b4767cb3f2769790e7c5ab539ea554abb37d7c Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 23:29:33 +0200
+Subject: [PATCH 1/2] wgpu-core: clear usage scopes by their members, not by
+ every resource index
+
+A usage scope is taken from a pool for each render or compute pass and
+cleared afterwards; clearing reset its tables over every buffer and
+texture index of the device. With tens of thousands of resources and
+~80 passes a frame that was a fifth of the renderer thread
+(BufferUsageScope::clear, Vec resizes, Arc drops). Now only the members'
+entries are reset and the tables keep their size.
+
+---
+ Cargo.toml            |  2 ++
+ src/track/buffer.rs   |  6 +++++-
+ src/track/metadata.rs |  9 ++++++++-
+ src/track/texture.rs  | 12 ++++++------
+ 4 files changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index f7042b5..b834f7f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -229,6 +229,8 @@ version = "30.0.0"
+ optional = true
+ 
+ [lints.rust]
++# re5osx: a path dependency gets its warnings shown; this one is upstream's.
++unfulfilled_lint_expectations = "allow"
+ missing_debug_implementations = "warn"
+ 
+ [lints.rust.unexpected_cfgs]
+diff --git a/src/track/buffer.rs b/src/track/buffer.rs
+index 8fdbe81..abd185c 100644
+--- a/src/track/buffer.rs
++++ b/src/track/buffer.rs
+@@ -91,8 +91,12 @@ impl BufferUsageScope {
+         strict_assert!(index < self.state.len());
+         self.metadata.tracker_assert_in_bounds(index);
+     }
++    /// Empties the scope; states outside it stay empty, so only its members
++    /// are reset (re5osx, see `ResourceMetadata::clear`).
+     pub fn clear(&mut self) {
+-        self.state.clear();
++        for index in self.metadata.owned_indices() {
++            self.state[index] = BufferUses::empty();
++        }
+         self.metadata.clear();
+     }
+ 
+diff --git a/src/track/metadata.rs b/src/track/metadata.rs
+index f946a53..6140970 100644
+--- a/src/track/metadata.rs
++++ b/src/track/metadata.rs
+@@ -34,8 +34,15 @@ impl<T: Clone> ResourceMetadata<T> {
+         resize_bitvec(&mut self.owned, size);
+     }
+ 
++    /// Empties the set, touching only its members: the tables keep their
++    /// size. (re5osx: usage scopes are cleared after every pass, and their
++    /// tables span every resource index of the device; resetting all of them
++    /// made each pass cost as much as the device has resources.)
+     pub(super) fn clear(&mut self) {
+-        self.resources.clear();
++        let resources = &mut self.resources;
++        for index in iterate_bitvec_indices(&self.owned) {
++            resources[index] = None;
++        }
+         self.owned.fill(false);
+     }
+ 
+diff --git a/src/track/texture.rs b/src/track/texture.rs
+index 6cea592..5fab1ba 100644
+--- a/src/track/texture.rs
++++ b/src/track/texture.rs
+@@ -183,11 +183,6 @@ impl TextureStateSet {
+         }
+     }
+ 
+-    fn clear(&mut self) {
+-        self.simple.clear();
+-        self.complex.clear();
+-    }
+-
+     fn set_size(&mut self, size: usize) {
+         self.simple.resize(size, TextureUses::UNINITIALIZED);
+     }
+@@ -284,8 +279,13 @@ impl TextureUsageScope {
+         self.set.tracker_assert_in_bounds(index);
+     }
+ 
++    /// Empties the scope; states outside it stay uninitialized, so only its
++    /// members are reset (re5osx, see `ResourceMetadata::clear`).
+     pub fn clear(&mut self) {
+-        self.set.clear();
++        for index in self.metadata.owned_indices() {
++            self.set.simple[index] = TextureUses::UNINITIALIZED;
++        }
++        self.set.complex.clear();
+         self.metadata.clear();
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

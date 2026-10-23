@@ -1,0 +1,18 @@
+[package]
+name = "re5osx-game"
+description = "The game module, recompiled from wasm to native code at build time (wasm2c)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "re5osx_game"
+build = "build/main.rs"
+
+[dependencies]
+parking_lot_core = "0.9"
+
+[build-dependencies]
+anyhow.workspace = true
+cc.workspace = true
+sha2.workspace = true
+wasmparser.workspace = true

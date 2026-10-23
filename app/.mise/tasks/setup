@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+#MISE description="Prepare the third-party code with our patches (again only when patches/ change)"
+# wgpu, wgpu-core, wgpu-hal and sp-fidelity from crates.io in
+# third_party/<name> (ignored by git), where the workspace's [patch.crates-io]
+# takes them, wasm2c built from third_party/wabt for the game's build
+# script, the natives' database, Luau's sources and the Studio editor's
+# JavaScript for re5osx-mods. A stamp of the
+# upstream version and the patches skips what is already prepared.
+set -euo pipefail
+
+# The crates.io releases the patches in patches/<name> apply to: name,
+# version and the sha256 of the crates.io archive.
+crates=(
+    "wgpu 30.0.1 527ccdf43dd5b2e8676eed9984ce00e2bbb0a1b85b70c1969dcb6cd2eb55ab9e"
+    "wgpu-core 30.0.1 14c018fce9b6270aa203c2fdd56f3cce996713534bd757e4ea58c8560b121f14"
+    "wgpu-hal 30.0.1 b6b7fb58561a792bc237628ba0792e332de418fefe145f13b5ed8201e6d52f58"
+    "sp-fidelity 0.2.0 5a9e75045752d10ebd2f1c37debac276b4fdfeddf1f3cc420f2b79b742b67d3b"
+)
+
+# Where the tools live; re5osx-game/build.rs looks in the same place.
+tools=${CARGO_TARGET_DIR:-$PWD/target}/re5osx-tools
+exe=
+[ "${OS:-}" = Windows_NT ] && exe=.exe
+
+sha256() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
+
+# Our patches for a project, patches/<name>/*.patch in order: their names and
+# contents, to stamp what they were applied to.
+patches_key() {
+    for patch in patches/"$1"/*.patch; do
+        printf ' %s:%s' "${patch##*/}" "$(git hash-object "$patch")"
+    done
+}
+
+# Applies the patches for $1 in directory $2. The copies sit inside this
+# repository: git must not discover it (above $3), or `git apply` resolves
+# paths against our root and silently skips everything. Patched files keep
+# their LF line endings whatever core.autocrlf says (Git for Windows sets it).
+apply_patches() {
+    for patch in patches/"$1"/*.patch; do
+        echo "applying ${patch##*/}"
+        GIT_CEILING_DIRECTORIES=$3 git -c core.autocrlf=false -C "$2" apply "$PWD/$patch"
+    done
+}
+
+mkdir -p "$tools"
+for crate in "${crates[@]}"; do
+    read -r name version sha <<<"$crate"
+    dest=third_party/$name
+    key="$version $sha$(patches_key "$name")"
+    if [ "$(cat "$dest/.re5osx-stamp" 2>/dev/null)" = "$key" ]; then
+        echo "$name is up to date ($dest)"
+        continue
+    fi
+    archive=$tools/$name-$version.crate
+    if [ ! -f "$archive" ] || [ "$(sha256 "$archive")" != "$sha" ]; then
+        curl -fsSL -o "$archive" "https://static.crates.io/crates/$name/$name-$version.crate"
+        [ "$(sha256 "$archive")" = "$sha" ] || { echo "$archive does not match its checksum" >&2; exit 1; }
+    fi
+    # Unpacked and patched next to its place, then moved there. The archive
+    # on stdin: Git for Windows' tar takes a D:/ path for a remote host.
+    tmp=$PWD/third_party/$name.tmp
+    rm -rf "$tmp" && mkdir -p "$tmp"
+    tar -xzf - -C "$tmp" <"$archive"
+    apply_patches "$name" "$tmp/$name-$version" "$tmp"
+    printf '%s' "$key" >"$tmp/$name-$version/.re5osx-stamp"
+    rm -rf "$dest" && mv "$tmp/$name-$version" "$dest" && rm -rf "$tmp"
+    echo "prepared $dest"
+done
+
+# The community's database of the natives (names of parameters, types,
+# documentation; it has no license, so it stays out of git): re5osx-mods'
+# build script joins it with what game.wasm says about each native.
+nativedb_commit=424fb51b089049a9fbcebcc641500b1d44d255b4
+nativedb_sha=d13c7e8d627dfe4eab11ba1c25b3621562ceebfe68b0fb5cfc0644d47469b441
+nativedb=third_party/nativedb/natives.json
+if [ ! -f "$nativedb" ] || [ "$(sha256 "$nativedb")" != "$nativedb_sha" ]; then
+    mkdir -p "${nativedb%/*}"
+    curl -fsSL -o "$nativedb.tmp" \
+        "https://raw.githubusercontent.com/alloc8or/gta5-nativedb-data/$nativedb_commit/natives.json"
+    [ "$(sha256 "$nativedb.tmp")" = "$nativedb_sha" ] || { echo "$nativedb does not match its checksum" >&2; exit 1; }
+    mv "$nativedb.tmp" "$nativedb"
+    echo "downloaded $nativedb"
+else
+    echo "nativedb is up to date ($nativedb)"
+fi
+
+# Luau's sources, for the type checker re5osx-mods builds into the game
+# (Luau.Analysis; mlua builds the rest from the same release).
+luau_version=0.740
+luau_sha=419f96e4ecf5a0dd415a2625ea7ea9dc8a407e86d64b25e00936302b25a7afbd
+if [ "$(cat third_party/luau/.re5osx-stamp 2>/dev/null)" != "$luau_version $luau_sha" ]; then
+    archive=$tools/luau-$luau_version.tar.gz
+    if [ ! -f "$archive" ] || [ "$(sha256 "$archive")" != "$luau_sha" ]; then
+        curl -fsSL -o "$archive" "https://github.com/luau-lang/luau/archive/refs/tags/$luau_version.tar.gz"
+        [ "$(sha256 "$archive")" = "$luau_sha" ] || { echo "$archive does not match its checksum" >&2; exit 1; }
+    fi
+    rm -rf third_party/luau.tmp && mkdir -p third_party/luau.tmp
+    tar -xzf - -C third_party/luau.tmp <"$archive"
+    printf '%s' "$luau_version $luau_sha" >"third_party/luau.tmp/luau-$luau_version/.re5osx-stamp"
+    rm -rf third_party/luau && mv "third_party/luau.tmp/luau-$luau_version" third_party/luau && rm -rf third_party/luau.tmp
+    echo "prepared third_party/luau"
+else
+    echo "luau is up to date (third_party/luau)"
+fi
+
+# The Studio editor's JavaScript (crates/re5osx-studio/packages.txt): npm
+# packages by their pinned integrity, without node; only each package's
+# entry module is kept.
+cm=third_party/codemirror
+cm_key="$(git hash-object crates/re5osx-studio/packages.txt)"
+if [ "$(cat "$cm/.re5osx-stamp" 2>/dev/null)" != "$cm_key" ]; then
+    rm -rf "$cm.tmp" && mkdir -p "$cm.tmp"
+    grep -v '^#' crates/re5osx-studio/packages.txt | while read -r name version integrity entry; do
+        [ -n "$name" ] || continue
+        archive=$tools/npm/${name//\//_}-$version.tgz
+        mkdir -p "$tools/npm"
+        want=${integrity#sha512-}
+        sum() { openssl dgst -sha512 -binary "$1" | openssl base64 -A; }
+        if [ ! -f "$archive" ] || [ "$(sum "$archive")" != "$want" ]; then
+            curl -fsSL -o "$archive" "https://registry.npmjs.org/$name/-/${name##*/}-$version.tgz"
+            [ "$(sum "$archive")" = "$want" ] || { echo "$archive does not match its integrity" >&2; exit 1; }
+        fi
+        mkdir -p "$cm.tmp/$name"
+        tar -xzf - -C "$cm.tmp/$name" --strip-components=1 "package/$entry" "package/LICENSE" <"$archive" 2>/dev/null ||
+            tar -xzf - -C "$cm.tmp/$name" --strip-components=1 "package/$entry" <"$archive"
+    done
+    printf '%s' "$cm_key" >"$cm.tmp/.re5osx-stamp"
+    rm -rf "$cm" && mv "$cm.tmp" "$cm"
+    echo "prepared $cm"
+else
+    echo "codemirror is up to date ($cm)"
+fi
+
+# wasm2c: only the nested submodules it needs (wabt also pulls large test suites).
+wabt=third_party/wabt
+wabt_commit=b835f1ce49e5803c597a0548099456d6be1d3d11
+if [ "$(git -C "$wabt" rev-parse HEAD 2>/dev/null)" != "$wabt_commit" ]; then
+    rm -rf "$wabt" && git init -q "$wabt"
+    git -C "$wabt" fetch -q --depth 1 https://github.com/WebAssembly/wabt.git "$wabt_commit"
+    git -C "$wabt" checkout -q FETCH_HEAD
+fi
+git -C "$wabt" submodule update --init --depth 1 third_party/picosha2 third_party/simde
+key="$(git -C "$wabt" rev-parse HEAD)$(patches_key wabt)"
+if [ "$(cat "$tools/wasm2c.stamp" 2>/dev/null)" = "$key" ] && [ -x "$tools/bin/wasm2c$exe" ]; then
+    echo "wasm2c is up to date ($tools/bin/wasm2c$exe)"
+    exit 0
+fi
+# A pristine copy of the pinned sources (LF, whatever core.autocrlf says),
+# then our patches on top.
+src=$tools/wabt-src
+# No stamp while the sources change: a build in between (or after this
+# stops half way) asks for setup instead of mixing old and new headers.
+rm -f "$tools/wasm2c.stamp"
+rm -rf "$src" && mkdir -p "$src"
+git -c core.autocrlf=input -C "$wabt" archive --format=tar HEAD | tar -xf - -C "$src"
+git -c core.autocrlf=input -C "$wabt/third_party/picosha2" archive --format=tar --prefix=third_party/picosha2/ HEAD |
+    tar -xf - -C "$src"
+apply_patches wabt "$src" "$tools"
+# A host tool: keep an iOS build environment (e.g. from Xcode) out of it.
+# On Windows CMake picks Visual Studio, a multi-config generator: the build
+# type is --config there, and the tool lands in Release/.
+env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET -u CC -u CXX -u CFLAGS -u CXXFLAGS \
+    cmake -S "$src" -B "$tools/wabt-build" -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTS=OFF -DBUILD_LIBWASM=OFF -DWITH_WASI=OFF -DBUILD_TOOLS=ON
+cmake --build "$tools/wabt-build" --config Release --target wasm2c --parallel "$(getconf _NPROCESSORS_ONLN)"
+mkdir -p "$tools/bin"
+built=$tools/wabt-build/wasm2c$exe
+[ -f "$built" ] || built=$tools/wabt-build/Release/wasm2c$exe
+cp "$built" "$tools/bin/wasm2c$exe"
+printf '%s' "$key" >"$tools/wasm2c.stamp"
+echo "built $tools/bin/wasm2c$exe"

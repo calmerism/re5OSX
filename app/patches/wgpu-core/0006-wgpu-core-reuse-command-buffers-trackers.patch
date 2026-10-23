@@ -1,0 +1,340 @@
+From 39931c08f9ff979ee4c86a508c75a8d6f77c74a7 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 22:54:30 +0200
+Subject: [PATCH] wgpu-core: reuse command buffers' trackers
+
+Each command buffer and each compute pass got a new tracker, whose
+tables then grew over every buffer and texture index of the device: with
+~200,000 resources in a game, allocating and filling them was the
+largest cost left in encoding command buffers. The device now keeps the
+trackers of finished command buffers (EncoderInFlight's drop) and
+compute passes in a pool, cleared by their members as usage scopes are,
+their tables kept. Pending writes take theirs from the pool too, so that
+every tracker the pool gives comes back once; it keeps at most 32, more
+than are in flight at once.
+
+---
+ src/command/compute.rs |  6 ++----
+ src/command/mod.rs     |  5 +----
+ src/device/queue.rs    | 15 ++++++++++++++-
+ src/device/resource.rs | 26 +++++++++++++++++++++++++-
+ src/lock/rank.rs       |  5 +++++
+ src/track/blas.rs      |  5 +++++
+ src/track/buffer.rs    | 11 +++++++++++
+ src/track/mod.rs       | 25 +++++++++++++++++++++++++
+ src/track/query_set.rs |  5 +++++
+ src/track/stateless.rs |  4 ++++
+ src/track/texture.rs   | 13 +++++++++++++
+ 11 files changed, 110 insertions(+), 10 deletions(-)
+
+diff --git a/src/command/compute.rs b/src/command/compute.rs
+index c4bc341..2312e90 100644
+--- a/src/command/compute.rs
++++ b/src/command/compute.rs
+@@ -708,10 +708,7 @@ pub(super) fn encode_compute_pass(
+ 
+         immediate_slots_set: Default::default(),
+ 
+-        intermediate_trackers: Tracker::new(
+-            device.ordered_buffer_usages,
+-            device.ordered_texture_usages,
+-        ),
++        intermediate_trackers: device.new_tracker(),
+     };
+ 
+     let indices = &device.tracker_indices;
+@@ -950,6 +947,7 @@ pub(super) fn encode_compute_pass(
+         &intermediate_trackers,
+         parent_state.snatch_guard,
+     );
++    device.recycle_tracker(intermediate_trackers);
+     // Close the command encoder, and swap it with the previous.
+     parent_state
+         .raw_encoder
+diff --git a/src/command/mod.rs b/src/command/mod.rs
+index c21880d..97f4cb9 100644
+--- a/src/command/mod.rs
++++ b/src/command/mod.rs
+@@ -928,10 +928,7 @@ impl CommandEncoder {
+                         api: EncodingApi::Undecided,
+                         label: label.to_string(),
+                     },
+-                    trackers: Tracker::new(
+-                        device.ordered_buffer_usages,
+-                        device.ordered_texture_usages,
+-                    ),
++                    trackers: device.new_tracker(),
+                     buffer_memory_init_actions: Default::default(),
+                     texture_memory_actions: Default::default(),
+                     as_actions: Default::default(),
+diff --git a/src/device/queue.rs b/src/device/queue.rs
+index 1c0ac26..9b02985 100644
+--- a/src/device/queue.rs
++++ b/src/device/queue.rs
+@@ -355,6 +355,19 @@ pub(crate) struct EncoderInFlight {
+     pub(crate) pending_blas_s: FastHashMap<TrackerIndex, Arc<Blas>>,
+ }
+ 
++impl Drop for EncoderInFlight {
++    /// The command buffer is done: its tracker goes back to the device's pool
++    /// (re5osx).
++    fn drop(&mut self) {
++        let device = &self.inner.device;
++        let trackers = mem::replace(
++            &mut self.trackers,
++            Tracker::new(device.ordered_buffer_usages, device.ordered_texture_usages),
++        );
++        device.recycle_tracker(trackers);
++    }
++}
++
+ /// A private command encoder for writes made directly on the device
+ /// or queue.
+ ///
+@@ -474,7 +487,7 @@ impl PendingWrites {
+                     api: crate::command::EncodingApi::InternalUse,
+                     label: "(wgpu internal) PendingWrites command encoder".into(),
+                 },
+-                trackers: Tracker::new(device.ordered_buffer_usages, device.ordered_texture_usages),
++                trackers: device.new_tracker(),
+                 temp_resources: mem::take(&mut self.temp_resources),
+                 _indirect_draw_validation_resources: crate::indirect_validation::DrawResources::new(
+                     device.clone(),
+diff --git a/src/device/resource.rs b/src/device/resource.rs
+index 872f460..a108222 100644
+--- a/src/device/resource.rs
++++ b/src/device/resource.rs
+@@ -54,7 +54,10 @@ use crate::{
+     resource_log,
+     snatch::{SnatchGuard, SnatchLock, Snatchable},
+     timestamp_normalization::TIMESTAMP_NORMALIZATION_BUFFER_USES,
+-    track::{BindGroupStates, DeviceTracker, TrackerIndexAllocators, UsageScope, UsageScopePool},
++    track::{
++        BindGroupStates, DeviceTracker, Tracker, TrackerIndexAllocators, TrackerPool, UsageScope,
++        UsageScopePool, TRACKER_POOL_MAX,
++    },
+     validation::{self, check_color_attachment_count, PassthroughInterface, ShaderMetaData},
+     weak_vec::WeakVec,
+     FastHashMap, LabelHelpers, OnceCellOrLock,
+@@ -273,6 +276,7 @@ pub struct Device {
+     pub(crate) instance_flags: wgt::InstanceFlags,
+     pub(crate) deferred_destroy: Mutex<Vec<DeferredDestroy>>,
+     pub(crate) usage_scopes: UsageScopePool,
++    pub(crate) tracker_pool: TrackerPool,
+     pub(crate) indirect_validation: Option<crate::indirect_validation::IndirectValidation>,
+     // Optional so that we can late-initialize this after the queue is created.
+     pub(crate) timestamp_normalizer:
+@@ -558,6 +562,7 @@ impl Device {
+             instance_flags,
+             deferred_destroy: Mutex::new(rank::DEVICE_DEFERRED_DESTROY, Vec::new()),
+             usage_scopes: Mutex::new(rank::DEVICE_USAGE_SCOPES, Default::default()),
++            tracker_pool: Mutex::new(rank::DEVICE_TRACKER_POOL, Vec::new()),
+             timestamp_normalizer: OnceCellOrLock::new(),
+             indirect_validation,
+         })
+@@ -5479,6 +5484,25 @@ impl Device {
+         )
+     }
+ 
++    /// An empty tracker for a command buffer or compute pass, from the pool
++    /// when there is one ([`Self::recycle_tracker`] gives it back).
++    pub(crate) fn new_tracker(&self) -> Tracker {
++        self.tracker_pool
++            .lock()
++            .pop()
++            .unwrap_or_else(|| Tracker::new(self.ordered_buffer_usages, self.ordered_texture_usages))
++    }
++
++    /// Empties a tracker [`Self::new_tracker`] gave and keeps it for reuse;
++    /// at most [`TRACKER_POOL_MAX`] are kept.
++    pub(crate) fn recycle_tracker(&self, mut tracker: Tracker) {
++        tracker.clear();
++        let mut pool = self.tracker_pool.lock();
++        if pool.len() < TRACKER_POOL_MAX {
++            pool.push(tracker);
++        }
++    }
++
+     pub fn get_hal_counters(&self) -> wgt::HalCounters {
+         self.raw().get_internal_counters()
+     }
+diff --git a/src/lock/rank.rs b/src/lock/rank.rs
+index f177dc6..27f5544 100644
+--- a/src/lock/rank.rs
++++ b/src/lock/rank.rs
+@@ -112,6 +112,7 @@ define_lock_ranks! {
+         COMMAND_ALLOCATOR_FREE_ENCODERS,
+         BUFFER_POOL,
+         DEVICE_TRACE,
++        DEVICE_TRACKER_POOL,
+         DEVICE_USAGE_SCOPES,
+         HUB_OTHER,
+         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+@@ -127,6 +128,7 @@ define_lock_ranks! {
+         BUFFER_INITIALIZATION_STATUS,
+         BUFFER_POOL,
+         DEVICE_TRACE,
++        DEVICE_TRACKER_POOL,
+         DEVICE_USAGE_SCOPES,
+         HUB_OTHER,
+         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+@@ -143,6 +145,7 @@ define_lock_ranks! {
+         QUEUE_LIFE_TRACKER,
+         COMMAND_ALLOCATOR_FREE_ENCODERS,
+         DEVICE_DEFERRED_DESTROY,
++        DEVICE_TRACKER_POOL,
+         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+     }
+     rank QUEUE_PENDING_WRITES "Queue::pending_writes" followed by {
+@@ -166,6 +169,7 @@ define_lock_ranks! {
+         COMMAND_ALLOCATOR_FREE_ENCODERS,
+         DEVICE_DEFERRED_DESTROY,
+         DEVICE_TRACE,
++        DEVICE_TRACKER_POOL,
+         SHARED_TRACKER_INDEX_ALLOCATOR_INNER,
+     }
+     rank BUFFER_MAP_STATE "Buffer::map_state" followed by {
+@@ -202,6 +206,7 @@ define_lock_ranks! {
+     rank BUFFER_POOL "BufferPool::buffers" followed by { }
+     rank DEVICE_DEFERRED_DESTROY "Device::deferred_destroy" followed by { }
+     rank DEVICE_TRACE "Device::trace" followed by { }
++    rank DEVICE_TRACKER_POOL "Device::tracker_pool" followed by { }
+     rank DEVICE_USAGE_SCOPES "Device::usage_scopes" followed by { }
+     rank HUB_EXTERNAL_TEXTURES "Hub::external_textures" followed by { }
+     rank SHARED_TRACKER_INDEX_ALLOCATOR_INNER "SharedTrackerIndexAllocator::inner" followed by { }
+diff --git a/src/track/blas.rs b/src/track/blas.rs
+index dec86aa..f0deb44 100644
+--- a/src/track/blas.rs
++++ b/src/track/blas.rs
+@@ -45,6 +45,11 @@ impl BlasTracker {
+         self.metadata.set_size(size)
+     }
+ 
++    /// Empties the tracker for reuse, keeping its size.
++    pub fn clear(&mut self) {
++        self.metadata.clear();
++    }
++
+     /// Extend the vectors to let the given index be valid.
+     fn allow_index(&mut self, index: usize) {
+         if index >= self.size {
+diff --git a/src/track/buffer.rs b/src/track/buffer.rs
+index abd185c..1892ac4 100644
+--- a/src/track/buffer.rs
++++ b/src/track/buffer.rs
+@@ -331,6 +331,17 @@ impl BufferTracker {
+         }
+     }
+ 
++    /// Empties the tracker for reuse, touching only its members: the tables
++    /// keep their size (re5osx, see `Tracker::clear`).
++    pub fn clear(&mut self) {
++        for index in self.metadata.owned_indices() {
++            self.start[index] = BufferUses::empty();
++            self.end[index] = BufferUses::empty();
++        }
++        self.metadata.clear();
++        self.temp.clear();
++    }
++
+     /// Returns true if the given buffer is tracked.
+     pub fn contains(&self, buffer: &Buffer) -> bool {
+         self.metadata.contains(buffer.tracker_index().as_usize())
+diff --git a/src/track/mod.rs b/src/track/mod.rs
+index bc88a30..0bd8bf4 100644
+--- a/src/track/mod.rs
++++ b/src/track/mod.rs
+@@ -618,6 +618,16 @@ impl DeviceTracker {
+     }
+ }
+ 
++/// A pool of [`Tracker`]s for command buffers and compute passes, cleared,
++/// with their tables sized (re5osx: a new tracker grew tables over every
++/// buffer and texture index of the device, for each command buffer and
++/// compute pass).
++pub(crate) type TrackerPool = Mutex<Vec<Tracker>>;
++
++/// The most trackers a [`TrackerPool`] keeps: more than are in flight at once
++/// (each command buffer until the GPU is done with it).
++pub(crate) const TRACKER_POOL_MAX: usize = 32;
++
+ /// A full double sided tracker used by CommandBuffers.
+ pub(crate) struct Tracker {
+     /// Buffers used within this command buffer.
+@@ -671,6 +681,21 @@ impl Tracker {
+         }
+     }
+ 
++    /// Empties the tracker for reuse, as [`Tracker::new`] would make it but
++    /// with its tables kept: only the members' entries are reset (re5osx).
++    pub fn clear(&mut self) {
++        self.buffers.clear();
++        self.textures.clear();
++        self.blas_s.clear();
++        self.tlas_s.clear();
++        self.views.clear();
++        self.bind_groups.clear();
++        self.compute_pipelines.clear();
++        self.render_pipelines.clear();
++        self.bundles.clear();
++        self.query_sets.clear();
++    }
++
+     /// Iterates through all resources in the given bind group and adopts
+     /// the state given for those resources in the UsageScope. It also
+     /// removes all touched resources from the usage scope.
+diff --git a/src/track/query_set.rs b/src/track/query_set.rs
+index 9f49362..ed1a4c4 100644
+--- a/src/track/query_set.rs
++++ b/src/track/query_set.rs
+@@ -45,6 +45,11 @@ impl QuerySetTracker {
+         self.metadata.set_size(size)
+     }
+ 
++    /// Empties the tracker for reuse, keeping its size.
++    pub fn clear(&mut self) {
++        self.metadata.clear();
++    }
++
+     /// Extend the vectors to let the given index be valid.
+     fn allow_index(&mut self, index: usize) {
+         if index >= self.size {
+diff --git a/src/track/stateless.rs b/src/track/stateless.rs
+index 26aec93..824a060 100644
+--- a/src/track/stateless.rs
++++ b/src/track/stateless.rs
+@@ -24,6 +24,10 @@ impl<T> StatelessTracker<T> {
+         self.resources.push(resource);
+         unsafe { self.resources.last().unwrap_unchecked() }
+     }
++
++    pub fn clear(&mut self) {
++        self.resources.clear();
++    }
+ }
+ 
+ impl<'a, T> IntoIterator for &'a StatelessTracker<T> {
+diff --git a/src/track/texture.rs b/src/track/texture.rs
+index 5fab1ba..439bc08 100644
+--- a/src/track/texture.rs
++++ b/src/track/texture.rs
+@@ -469,6 +469,19 @@ impl TextureTracker {
+         }
+     }
+ 
++    /// Empties the tracker for reuse, touching only its members: the tables
++    /// keep their size (re5osx, see `Tracker::clear`).
++    pub fn clear(&mut self) {
++        for index in self.metadata.owned_indices() {
++            self.start_set.simple[index] = TextureUses::UNINITIALIZED;
++            self.end_set.simple[index] = TextureUses::UNINITIALIZED;
++        }
++        self.start_set.complex.clear();
++        self.end_set.complex.clear();
++        self.metadata.clear();
++        self.temp.clear();
++    }
++
+     /// Returns true if the tracker owns the given texture.
+     pub fn contains(&self, texture: &Texture) -> bool {
+         self.metadata.contains(texture.tracker_index().as_usize())

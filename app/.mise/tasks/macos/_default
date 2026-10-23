@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+#MISE description="Build and open the macOS app through Launch Services"
+#MISE depends=["macos:build"]
+#USAGE arg "[args]..." var=#true help="Passed to the app (e.g. --play, an absolute game directory)"
+set -euo pipefail
+exec "$(dirname "$0")/run" "$@"

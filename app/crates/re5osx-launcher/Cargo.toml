@@ -1,0 +1,24 @@
+[package]
+name = "re5osx-launcher"
+description = "re5OSX, the app people download: in a window of its own, it sets the game folder up and makes re5OSX on this Mac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "re5OSX"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+flate2 = "1"
+regex = "1"
+# The window: WebKit's view of the launcher's page.
+tao = "0.37"
+wry = "0.57"
+# Setup: the game's archives (AES), its sounds (Opus) and the tiles' pictures.
+aes = "0.8"
+audiopus_sys = { version = "0.2", features = ["static"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

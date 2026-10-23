@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 09:00:00 +0200
+Subject: [PATCH] wgpu-hal: command buffers suspended and resumed
+
+CommandEncoder::suspend_encoding is end_encoding for a command buffer
+that resume_encoding can record into again later, while other command
+buffers are begun and ended meanwhile; it must be resumed and ended
+before it is submitted. can_suspend says whether an encoder supports it
+(default: no, and suspend_encoding is end_encoding).
+
+Metal: nothing is ended at Metal's level before commit, so a command
+buffer end_encoding returned can take more encoders.
+
+Not Vulkan, where it would leave a command buffer recording (not ended)
+while others of its pool are begun, recorded and ended, and record into
+it again after them. Vulkan allows it, but drivers rarely see it: with
+it, a Mali-G925 (MediaTek, Android 16) faulted on GPU address 0x80 under
+heavy streaming and the kernel terminated the context, and the fault
+grew rarer, not gone, as the pools gave less of their command memory
+back (wgpu-hal 0003, 0006). Vulkan records one command buffer of a pool
+at a time, as upstream does.
+
+wgpu-core uses it to record a pass's barriers at the end of the command
+buffer before the pass instead of in one of their own (patches/wgpu-core
+0007).
+---
+diff --git a/src/dynamic/command.rs b/src/dynamic/command.rs
+index 85b80a8..0a519ac 100644
+--- a/src/dynamic/command.rs
++++ b/src/dynamic/command.rs
+@@ -22,6 +22,12 @@ pub trait DynCommandEncoder: DynResource + core::fmt::Debug {
+ 
+     unsafe fn end_encoding(&mut self) -> Result<Box<dyn DynCommandBuffer>, DeviceError>;
+ 
++    fn can_suspend(&self) -> bool;
++
++    unsafe fn suspend_encoding(&mut self) -> Result<Box<dyn DynCommandBuffer>, DeviceError>;
++
++    unsafe fn resume_encoding(&mut self, command_buffer: Box<dyn DynCommandBuffer>);
++
+     unsafe fn reset_all(&mut self, command_buffers: Vec<Box<dyn DynCommandBuffer>>);
+ 
+     unsafe fn transition_buffers(&mut self, barriers: &[BufferBarrier<'_, dyn DynBuffer>]);
+@@ -252,6 +258,22 @@ impl<C: CommandEncoder + DynResource> DynCommandEncoder for C {
+         })
+     }
+ 
++    fn can_suspend(&self) -> bool {
++        C::can_suspend(self)
++    }
++
++    unsafe fn suspend_encoding(&mut self) -> Result<Box<dyn DynCommandBuffer>, DeviceError> {
++        unsafe { C::suspend_encoding(self) }.map(|cb| {
++            let boxed_command_buffer: Box<<C::A as Api>::CommandBuffer> = Box::new(cb);
++            let boxed_command_buffer: Box<dyn DynCommandBuffer> = boxed_command_buffer;
++            boxed_command_buffer
++        })
++    }
++
++    unsafe fn resume_encoding(&mut self, command_buffer: Box<dyn DynCommandBuffer>) {
++        unsafe { C::resume_encoding(self, command_buffer.unbox()) }
++    }
++
+     unsafe fn reset_all(&mut self, command_buffers: Vec<Box<dyn DynCommandBuffer>>) {
+         unsafe { C::reset_all(self, command_buffers.into_iter().map(|cb| cb.unbox())) }
+     }
+diff --git a/src/lib.rs b/src/lib.rs
+index 711d88e..f4a84af 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1430,6 +1430,48 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
+     /// [`begin_encoding`]: CommandEncoder::begin_encoding
+     unsafe fn end_encoding(&mut self) -> Result<<Self::A as Api>::CommandBuffer, DeviceError>;
+ 
++    /// Whether [`suspend_encoding`] and [`resume_encoding`] are available.
++    ///
++    /// [`suspend_encoding`]: CommandEncoder::suspend_encoding
++    /// [`resume_encoding`]: CommandEncoder::resume_encoding
++    fn can_suspend(&self) -> bool {
++        false
++    }
++
++    /// Like [`end_encoding`], but the returned [`CommandBuffer`] can be
++    /// resumed ([`resume_encoding`]) and recorded into further. Other
++    /// command buffers may be begun and ended on this encoder meanwhile.
++    ///
++    /// A suspended command buffer must be resumed and ended with
++    /// [`end_encoding`] before it is submitted.
++    ///
++    /// # Safety
++    ///
++    /// As [`end_encoding`].
++    ///
++    /// [`CommandBuffer`]: Api::CommandBuffer
++    /// [`end_encoding`]: CommandEncoder::end_encoding
++    /// [`resume_encoding`]: CommandEncoder::resume_encoding
++    unsafe fn suspend_encoding(&mut self) -> Result<<Self::A as Api>::CommandBuffer, DeviceError> {
++        unsafe { self.end_encoding() }
++    }
++
++    /// Puts this `CommandEncoder` in the "recording" state again, recording
++    /// after the commands already in `command_buffer`.
++    ///
++    /// # Safety
++    ///
++    /// [`can_suspend`] must be true, this `CommandEncoder` must be in the
++    /// "closed" state, and `command_buffer` must come from
++    /// [`suspend_encoding`] on this encoder, not ended since.
++    ///
++    /// [`can_suspend`]: CommandEncoder::can_suspend
++    /// [`suspend_encoding`]: CommandEncoder::suspend_encoding
++    unsafe fn resume_encoding(&mut self, command_buffer: <Self::A as Api>::CommandBuffer) {
++        let _ = command_buffer;
++        unreachable!("resume_encoding without can_suspend")
++    }
++
+     /// Reclaim all resources belonging to this `CommandEncoder`.
+     ///
+     /// # Safety
+diff --git a/src/metal/command.rs b/src/metal/command.rs
+index 8de94e0..46ee564 100644
+--- a/src/metal/command.rs
++++ b/src/metal/command.rs
+@@ -600,6 +600,23 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         })
+     }
+ 
++    /// Nothing is ended at Metal's level before the command buffer is
++    /// committed: a command buffer that `end_encoding` returned (as
++    /// `suspend_encoding` does) can be recorded into again.
++    fn can_suspend(&self) -> bool {
++        true
++    }
++
++    unsafe fn resume_encoding(&mut self, command_buffer: super::CommandBuffer) {
++        debug_assert!(!self.recording && self.raw_cmd_buf.is_none());
++        let mut command_buffer = command_buffer;
++        self.recording = true;
++        self.label = None;
++        // Taken, so that dropping `command_buffer` does not count it as
++        // never submitted.
++        self.raw_cmd_buf = command_buffer.raw.take();
++    }
++
+     unsafe fn reset_all<I>(&mut self, _cmd_bufs: I)
+     where
+         I: Iterator<Item = super::CommandBuffer>,

@@ -1,0 +1,20 @@
+/target
+/game
+/third_party/wgpu
+/third_party/wgpu.tmp
+/third_party/wgpu-core
+/third_party/wgpu-core.tmp
+/third_party/wgpu-hal
+/third_party/wgpu-hal.tmp
+/third_party/sp-fidelity
+/third_party/sp-fidelity.tmp
+/third_party/nativedb
+/third_party/luau
+/third_party/luau.tmp
+/third_party/codemirror
+/third_party/codemirror.tmp
+.DS_Store
+# Personal mise settings.
+/.mise/config.local.toml
+
+/third_party/wabt

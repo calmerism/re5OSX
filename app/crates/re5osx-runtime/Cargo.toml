@@ -1,0 +1,34 @@
+[package]
+name = "re5osx-runtime"
+description = "Host side of the game: Emscripten/WASI imports, threads, files, audio and input plumbing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+re5osx-game.workspace = true
+re5osx-stream.workspace = true
+re5osx-qos.workspace = true
+anyhow.workspace = true
+log.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+serde = { version = "1", features = ["derive"] }
+# Friends' channel: the Noise protocol (IK between friends, XXpsk0 for a
+# friend code), pure Rust, ChaCha20-Poly1305, BLAKE2s, X25519.
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+# /dev/urandom for the engine, which Windows does not have.
+getrandom = "0.4"
+# Keyed BLAKE2s (snow's own): the players' cookies, the handshakes' MACs.
+blake2 = "0.10"
+# The system's time zone, the same way on every platform.
+jiff = "0.2"
+# The engine's inflate, natively (clib.rs).
+zlib-rs = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading"] }

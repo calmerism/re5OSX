@@ -1,0 +1,63 @@
+#!/bin/bash
+# Makes "re5OSX.app" on the player's Mac: compiles their game.wasm
+# (re5osx-gamec) and links it with the prebuilt app (libre5osx_app.a). Needs
+# only Apple's Command Line Tools (clang, ld, codesign).
+#
+#   link-app <kit dir> <game dir> <work dir> <output .app>
+#
+# The kit is what `mise run macos:download` puts in re5OSX.app; the work dir keeps the
+# translated C and its objects, so a second run takes seconds. Progress goes
+# to stdout as "step: <text>" lines.
+set -euo pipefail
+
+kit=$(cd "$1" && pwd)
+game=$(cd "$2" && pwd)
+mkdir -p "$3"
+work=$(cd "$3" && pwd)
+app=$4
+
+step() { echo "step: $*"; }
+
+# The original game.wasm (the build accepts only the builds it knows; a
+# changed one is kept by its owner as game.wasm.orig).
+build=$(cd "$game/b" && ls -d */ | head -1 | tr -d /)
+[ -n "$build" ] || { echo "no b/<build> under $game" >&2; exit 1; }
+wasm="$game/b/$build/game.wasm"
+[ -f "$wasm.orig" ] && wasm="$wasm.orig"
+rm -rf "$work/game"
+mkdir -p "$work/game/b/$build"
+ln -s "$wasm" "$work/game/b/$build/game.wasm"
+
+# re5osx-gamec reads the build tools from <target>/re5osx-tools and writes
+# the translated C and objects there too.
+tools="$work/re5osx-tools"
+mkdir -p "$tools/bin" "$work/out"
+ln -sf "$kit/wasm2c" "$tools/bin/wasm2c"
+ln -sfn "$kit/wabt-src" "$tools/wabt-src"
+cp "$kit/wasm2c.stamp" "$tools/wasm2c.stamp"
+
+step "Compiling the game for Apple silicon"
+env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    CARGO_MANIFEST_DIR="$kit/crates/re5osx-game" OUT_DIR="$work/out" CARGO_TARGET_DIR="$work" \
+    RE5OSX_GAME_DIR="$work/game" TARGET=aarch64-apple-darwin HOST=aarch64-apple-darwin \
+    OPT_LEVEL=2 PROFILE=release DEBUG=false NUM_JOBS="$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu)" \
+    CARGO_CFG_TARGET_OS=macos CARGO_CFG_TARGET_ARCH=aarch64 CARGO_CFG_TARGET_VENDOR=apple CARGO_CFG_TARGET_ENV= \
+    MACOSX_DEPLOYMENT_TARGET=14.0 CC=/usr/bin/clang AR=/usr/bin/ar \
+    "$kit/re5osx-gamec" | grep -v '^cargo:'
+
+step "Linking"
+contents="$app.tmp/Contents"
+rm -rf "$app.tmp"
+mkdir -p "$contents/MacOS" "$contents/Resources"
+echo 'int re5osx_main(void); int main(void) { return re5osx_main(); }' > "$work/main.c"
+# shellcheck disable=SC2046
+/usr/bin/clang -O2 -mmacosx-version-min=14.0 -Wl,-dead_strip -o "$contents/MacOS/re5osx" "$work/main.c" \
+    "$kit/libre5osx_app.a" "$work/out/libre5osx_game.a" $(cat "$kit/link-flags")
+
+step "Making the app"
+cp "$kit/Info.plist" "$contents/Info.plist"
+cp "$kit/re5OSX.icns" "$kit/Assets.car" "$contents/Resources/"
+codesign --force --sign - "$app.tmp" >/dev/null 2>&1
+rm -rf "$app"
+mv "$app.tmp" "$app"
+step "Done"

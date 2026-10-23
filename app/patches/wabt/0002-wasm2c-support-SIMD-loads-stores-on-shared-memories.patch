@@ -1,0 +1,420 @@
+From 006678d083dda764484b080e4c83a5c590c42a4e Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Sat, 10 Oct 2026 14:31:52 +0200
+Subject: [PATCH 2/3] wasm2c: support SIMD loads/stores on shared memories
+
+Lane, splat and zero loads/stores ignored the memory kind and always
+called the unshared helpers, and the SIMD template only defined unshared
+helpers. Route all SIMD memory ops through GetMemoryAPIString and define
+*_shared variants (plain copies: wasm SIMD accesses are not atomic).
+---
+ src/c-writer.cc                         |  13 +-
+ src/template/wasm2c_simd.declarations.c | 194 ++++++++++++++++++++++++
+ 2 files changed, 202 insertions(+), 5 deletions(-)
+
+diff --git a/src/c-writer.cc b/src/c-writer.cc
+index eb22ef2..0005750 100644
+--- a/src/c-writer.cc
++++ b/src/c-writer.cc
+@@ -5944,8 +5944,10 @@ void CWriter::Write(const SimdLoadLaneExpr& expr) {
+   }
+   // clang-format on
+   Memory* memory = module_->memories[module_->GetMemoryIndex(expr.memidx)];
++  std::string api =
++      GetMemoryAPIString(*memory, func + std::to_string(expr.val));
+   Type result_type = expr.opcode.GetResultType();
+-  Write(StackVar(1, result_type), " = ", func, expr.val,
++  Write(StackVar(1, result_type), " = ", api,
+         "(wasm_rt_local_memory_base, wasm_rt_local_memory_size, ");
+   Write(ExternalInstancePtr(ModuleFieldType::Memory, memory->name), ", ");
+   WriteMemoryAddress(1, memory, expr.offset);
+@@ -5969,9 +5971,10 @@ void CWriter::Write(const SimdStoreLaneExpr& expr) {
+   }
+   // clang-format on
+   Memory* memory = module_->memories[module_->GetMemoryIndex(expr.memidx)];
++  std::string api =
++      GetMemoryAPIString(*memory, func + std::to_string(expr.val));
+ 
+-  Write(func, expr.val,
+-        "(wasm_rt_local_memory_base, wasm_rt_local_memory_size, ");
++  Write(api, "(wasm_rt_local_memory_base, wasm_rt_local_memory_size, ");
+   Write(ExternalInstancePtr(ModuleFieldType::Memory, memory->name), ", ");
+   WriteMemoryAddress(1, memory, expr.offset);
+   Write(", ", StackVar(0));
+@@ -6014,7 +6017,7 @@ void CWriter::Write(const LoadSplatExpr& expr) {
+   }
+   // clang-format on
+   Type result_type = expr.opcode.GetResultType();
+-  Write(StackVar(0, result_type), " = ", func,
++  Write(StackVar(0, result_type), " = ", GetMemoryAPIString(*memory, func),
+         "(wasm_rt_local_memory_base, wasm_rt_local_memory_size, ");
+   Write(ExternalInstancePtr(ModuleFieldType::Memory, memory->name), ", ");
+   WriteMemoryAddress(0, memory, expr.offset);
+@@ -6038,7 +6041,7 @@ void CWriter::Write(const LoadZeroExpr& expr) {
+   // clang-format on
+ 
+   Type result_type = expr.opcode.GetResultType();
+-  Write(StackVar(0, result_type), " = ", func,
++  Write(StackVar(0, result_type), " = ", GetMemoryAPIString(*memory, func),
+         "(wasm_rt_local_memory_base, wasm_rt_local_memory_size, ");
+   Write(ExternalInstancePtr(ModuleFieldType::Memory, memory->name), ", ");
+   WriteMemoryAddress(0, memory, expr.offset);
+diff --git a/src/template/wasm2c_simd.declarations.c b/src/template/wasm2c_simd.declarations.c
+index 9e1a1f9..e53438c 100644
+--- a/src/template/wasm2c_simd.declarations.c
++++ b/src/template/wasm2c_simd.declarations.c
+@@ -71,6 +71,66 @@
+   }                                                                       \
+   DEF_MEM_CHECKS1(name, _, t, , void, v128);
+ 
++// Shared-memory variants. Wasm SIMD accesses are not atomic, so a plain copy
++// out of (or into) the shared buffer is sufficient.
++#ifdef WASM_RT_C11_AVAILABLE
++#define SIMD_SHARED_ADDR(mem, addr, n) \
++  ((void*)(uintptr_t)MEM_ADDR(mem, addr, n))
++
++#define DEFINE_SIMD_LOAD_FUNC_SHARED(name, func, t)                          \
++  static inline v128 name##_shared_unchecked(                                \
++      uint8_t* const wasm_rt_local_memory_base, wasm_rt_shared_memory_t* mem, \
++      u64 addr) {                                                            \
++    t simd_mem_value;                                                        \
++    wasm_rt_memcpy(&simd_mem_value, SIMD_SHARED_ADDR(mem, addr, sizeof(t)),  \
++                   sizeof(t));                                               \
++    v128 result = func(&simd_mem_value);                                     \
++    SIMD_FORCE_READ(result);                                                 \
++    return result;                                                           \
++  }                                                                          \
++  DEF_MEM_CHECKS0(name##_shared, _shared_, t, return, v128);
++
++#define DEFINE_SIMD_LOAD_LANE_SHARED(name, func, t, lane)                    \
++  static inline v128 name##_shared_unchecked(                                \
++      uint8_t* const wasm_rt_local_memory_base, wasm_rt_shared_memory_t* mem, \
++      u64 addr, v128 vec) {                                                  \
++    t simd_mem_value;                                                        \
++    wasm_rt_memcpy(&simd_mem_value, SIMD_SHARED_ADDR(mem, addr, sizeof(t)),  \
++                   sizeof(t));                                               \
++    v128 result = func(&simd_mem_value, vec, lane);                          \
++    SIMD_FORCE_READ(result);                                                 \
++    return result;                                                           \
++  }                                                                          \
++  DEF_MEM_CHECKS1(name##_shared, _shared_, t, return, v128, v128);
++
++#define DEFINE_SIMD_STORE_SHARED(name, t)                                    \
++  static inline void name##_shared_unchecked(                                \
++      uint8_t* const wasm_rt_local_memory_base, wasm_rt_shared_memory_t* mem, \
++      u64 addr, v128 value) {                                                \
++    t simd_mem_value;                                                        \
++    simde_wasm_v128_store(&simd_mem_value, value);                           \
++    wasm_rt_memcpy(SIMD_SHARED_ADDR(mem, addr, sizeof(t)), &simd_mem_value,  \
++                   sizeof(t));                                               \
++  }                                                                          \
++  DEF_MEM_CHECKS1(name##_shared, _shared_, t, , void, v128);
++
++#define DEFINE_SIMD_STORE_LANE_SHARED(name, func, t, lane)                   \
++  static inline void name##_shared_unchecked(                                \
++      uint8_t* const wasm_rt_local_memory_base, wasm_rt_shared_memory_t* mem, \
++      u64 addr, v128 value) {                                                \
++    t simd_mem_value;                                                        \
++    func(&simd_mem_value, value, lane);                                      \
++    wasm_rt_memcpy(SIMD_SHARED_ADDR(mem, addr, sizeof(t)), &simd_mem_value,  \
++                   sizeof(t));                                               \
++  }                                                                          \
++  DEF_MEM_CHECKS1(name##_shared, _shared_, t, , void, v128);
++#else
++#define DEFINE_SIMD_LOAD_FUNC_SHARED(name, func, t)
++#define DEFINE_SIMD_LOAD_LANE_SHARED(name, func, t, lane)
++#define DEFINE_SIMD_STORE_SHARED(name, t)
++#define DEFINE_SIMD_STORE_LANE_SHARED(name, func, t, lane)
++#endif
++
+ // clang-format off
+ #if WABT_BIG_ENDIAN
+ static inline v128 v128_impl_load32_zero(const void* a) {
+@@ -89,150 +149,284 @@ static inline v128 v128_impl_load64_zero(const void* a) {
+ #endif
+ 
+ DEFINE_SIMD_LOAD_FUNC(v128_load, simde_wasm_v128_load, v128)
++DEFINE_SIMD_LOAD_FUNC_SHARED(v128_load, simde_wasm_v128_load, v128)
+ 
+ DEFINE_SIMD_LOAD_FUNC(v128_load8_splat, simde_wasm_v128_load8_splat, u8)
++DEFINE_SIMD_LOAD_FUNC_SHARED(v128_load8_splat, simde_wasm_v128_load8_splat, u8)
+ DEFINE_SIMD_LOAD_FUNC(v128_load16_splat, simde_wasm_v128_load16_splat, u16)
++DEFINE_SIMD_LOAD_FUNC_SHARED(v128_load16_splat, simde_wasm_v128_load16_splat, u16)
+ DEFINE_SIMD_LOAD_FUNC(v128_load32_splat, simde_wasm_v128_load32_splat, u32)
++DEFINE_SIMD_LOAD_FUNC_SHARED(v128_load32_splat, simde_wasm_v128_load32_splat, u32)
+ DEFINE_SIMD_LOAD_FUNC(v128_load64_splat, simde_wasm_v128_load64_splat, u64)
++DEFINE_SIMD_LOAD_FUNC_SHARED(v128_load64_splat, simde_wasm_v128_load64_splat, u64)
+ 
+ DEFINE_SIMD_LOAD_FUNC(i16x8_load8x8, simde_wasm_i16x8_load8x8, u64)
++DEFINE_SIMD_LOAD_FUNC_SHARED(i16x8_load8x8, simde_wasm_i16x8_load8x8, u64)
+ DEFINE_SIMD_LOAD_FUNC(u16x8_load8x8, simde_wasm_u16x8_load8x8, u64)
++DEFINE_SIMD_LOAD_FUNC_SHARED(u16x8_load8x8, simde_wasm_u16x8_load8x8, u64)
+ DEFINE_SIMD_LOAD_FUNC(i32x4_load16x4, simde_wasm_i32x4_load16x4, u64)
++DEFINE_SIMD_LOAD_FUNC_SHARED(i32x4_load16x4, simde_wasm_i32x4_load16x4, u64)
+ DEFINE_SIMD_LOAD_FUNC(u32x4_load16x4, simde_wasm_u32x4_load16x4, u64)
++DEFINE_SIMD_LOAD_FUNC_SHARED(u32x4_load16x4, simde_wasm_u32x4_load16x4, u64)
+ DEFINE_SIMD_LOAD_FUNC(i64x2_load32x2, simde_wasm_i64x2_load32x2, u64)
++DEFINE_SIMD_LOAD_FUNC_SHARED(i64x2_load32x2, simde_wasm_i64x2_load32x2, u64)
+ DEFINE_SIMD_LOAD_FUNC(u64x2_load32x2, simde_wasm_u64x2_load32x2, u64)
++DEFINE_SIMD_LOAD_FUNC_SHARED(u64x2_load32x2, simde_wasm_u64x2_load32x2, u64)
+ 
+ DEFINE_SIMD_LOAD_FUNC(v128_load32_zero, v128_impl_load32_zero, u32)
++DEFINE_SIMD_LOAD_FUNC_SHARED(v128_load32_zero, v128_impl_load32_zero, u32)
+ DEFINE_SIMD_LOAD_FUNC(v128_load64_zero, v128_impl_load64_zero, u64)
++DEFINE_SIMD_LOAD_FUNC_SHARED(v128_load64_zero, v128_impl_load64_zero, u64)
+ 
+ #if WABT_BIG_ENDIAN
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane0, simde_wasm_v128_load8_lane, u8, 15)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane0, simde_wasm_v128_load8_lane, u8, 15)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane1, simde_wasm_v128_load8_lane, u8, 14)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane1, simde_wasm_v128_load8_lane, u8, 14)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane2, simde_wasm_v128_load8_lane, u8, 13)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane2, simde_wasm_v128_load8_lane, u8, 13)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane3, simde_wasm_v128_load8_lane, u8, 12)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane3, simde_wasm_v128_load8_lane, u8, 12)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane4, simde_wasm_v128_load8_lane, u8, 11)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane4, simde_wasm_v128_load8_lane, u8, 11)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane5, simde_wasm_v128_load8_lane, u8, 10)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane5, simde_wasm_v128_load8_lane, u8, 10)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane6, simde_wasm_v128_load8_lane, u8, 9)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane6, simde_wasm_v128_load8_lane, u8, 9)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane7, simde_wasm_v128_load8_lane, u8, 8)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane7, simde_wasm_v128_load8_lane, u8, 8)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane8, simde_wasm_v128_load8_lane, u8, 7)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane8, simde_wasm_v128_load8_lane, u8, 7)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane9, simde_wasm_v128_load8_lane, u8, 6)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane9, simde_wasm_v128_load8_lane, u8, 6)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane10, simde_wasm_v128_load8_lane, u8, 5)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane10, simde_wasm_v128_load8_lane, u8, 5)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane11, simde_wasm_v128_load8_lane, u8, 4)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane11, simde_wasm_v128_load8_lane, u8, 4)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane12, simde_wasm_v128_load8_lane, u8, 3)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane12, simde_wasm_v128_load8_lane, u8, 3)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane13, simde_wasm_v128_load8_lane, u8, 2)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane13, simde_wasm_v128_load8_lane, u8, 2)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane14, simde_wasm_v128_load8_lane, u8, 1)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane14, simde_wasm_v128_load8_lane, u8, 1)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane15, simde_wasm_v128_load8_lane, u8, 0)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane15, simde_wasm_v128_load8_lane, u8, 0)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane0, simde_wasm_v128_load16_lane, u16, 7)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane0, simde_wasm_v128_load16_lane, u16, 7)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane1, simde_wasm_v128_load16_lane, u16, 6)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane1, simde_wasm_v128_load16_lane, u16, 6)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane2, simde_wasm_v128_load16_lane, u16, 5)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane2, simde_wasm_v128_load16_lane, u16, 5)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane3, simde_wasm_v128_load16_lane, u16, 4)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane3, simde_wasm_v128_load16_lane, u16, 4)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane4, simde_wasm_v128_load16_lane, u16, 3)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane4, simde_wasm_v128_load16_lane, u16, 3)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane5, simde_wasm_v128_load16_lane, u16, 2)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane5, simde_wasm_v128_load16_lane, u16, 2)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane6, simde_wasm_v128_load16_lane, u16, 1)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane6, simde_wasm_v128_load16_lane, u16, 1)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane7, simde_wasm_v128_load16_lane, u16, 0)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane7, simde_wasm_v128_load16_lane, u16, 0)
+ DEFINE_SIMD_LOAD_LANE(v128_load32_lane0, simde_wasm_v128_load32_lane, u32, 3)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load32_lane0, simde_wasm_v128_load32_lane, u32, 3)
+ DEFINE_SIMD_LOAD_LANE(v128_load32_lane1, simde_wasm_v128_load32_lane, u32, 2)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load32_lane1, simde_wasm_v128_load32_lane, u32, 2)
+ DEFINE_SIMD_LOAD_LANE(v128_load32_lane2, simde_wasm_v128_load32_lane, u32, 1)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load32_lane2, simde_wasm_v128_load32_lane, u32, 1)
+ DEFINE_SIMD_LOAD_LANE(v128_load32_lane3, simde_wasm_v128_load32_lane, u32, 0)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load32_lane3, simde_wasm_v128_load32_lane, u32, 0)
+ DEFINE_SIMD_LOAD_LANE(v128_load64_lane0, simde_wasm_v128_load64_lane, u64, 1)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load64_lane0, simde_wasm_v128_load64_lane, u64, 1)
+ DEFINE_SIMD_LOAD_LANE(v128_load64_lane1, simde_wasm_v128_load64_lane, u64, 0)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load64_lane1, simde_wasm_v128_load64_lane, u64, 0)
+ #else
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane0, simde_wasm_v128_load8_lane, u8, 0)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane0, simde_wasm_v128_load8_lane, u8, 0)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane1, simde_wasm_v128_load8_lane, u8, 1)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane1, simde_wasm_v128_load8_lane, u8, 1)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane2, simde_wasm_v128_load8_lane, u8, 2)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane2, simde_wasm_v128_load8_lane, u8, 2)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane3, simde_wasm_v128_load8_lane, u8, 3)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane3, simde_wasm_v128_load8_lane, u8, 3)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane4, simde_wasm_v128_load8_lane, u8, 4)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane4, simde_wasm_v128_load8_lane, u8, 4)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane5, simde_wasm_v128_load8_lane, u8, 5)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane5, simde_wasm_v128_load8_lane, u8, 5)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane6, simde_wasm_v128_load8_lane, u8, 6)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane6, simde_wasm_v128_load8_lane, u8, 6)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane7, simde_wasm_v128_load8_lane, u8, 7)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane7, simde_wasm_v128_load8_lane, u8, 7)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane8, simde_wasm_v128_load8_lane, u8, 8)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane8, simde_wasm_v128_load8_lane, u8, 8)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane9, simde_wasm_v128_load8_lane, u8, 9)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane9, simde_wasm_v128_load8_lane, u8, 9)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane10, simde_wasm_v128_load8_lane, u8, 10)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane10, simde_wasm_v128_load8_lane, u8, 10)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane11, simde_wasm_v128_load8_lane, u8, 11)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane11, simde_wasm_v128_load8_lane, u8, 11)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane12, simde_wasm_v128_load8_lane, u8, 12)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane12, simde_wasm_v128_load8_lane, u8, 12)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane13, simde_wasm_v128_load8_lane, u8, 13)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane13, simde_wasm_v128_load8_lane, u8, 13)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane14, simde_wasm_v128_load8_lane, u8, 14)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane14, simde_wasm_v128_load8_lane, u8, 14)
+ DEFINE_SIMD_LOAD_LANE(v128_load8_lane15, simde_wasm_v128_load8_lane, u8, 15)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load8_lane15, simde_wasm_v128_load8_lane, u8, 15)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane0, simde_wasm_v128_load16_lane, u16, 0)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane0, simde_wasm_v128_load16_lane, u16, 0)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane1, simde_wasm_v128_load16_lane, u16, 1)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane1, simde_wasm_v128_load16_lane, u16, 1)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane2, simde_wasm_v128_load16_lane, u16, 2)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane2, simde_wasm_v128_load16_lane, u16, 2)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane3, simde_wasm_v128_load16_lane, u16, 3)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane3, simde_wasm_v128_load16_lane, u16, 3)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane4, simde_wasm_v128_load16_lane, u16, 4)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane4, simde_wasm_v128_load16_lane, u16, 4)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane5, simde_wasm_v128_load16_lane, u16, 5)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane5, simde_wasm_v128_load16_lane, u16, 5)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane6, simde_wasm_v128_load16_lane, u16, 6)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane6, simde_wasm_v128_load16_lane, u16, 6)
+ DEFINE_SIMD_LOAD_LANE(v128_load16_lane7, simde_wasm_v128_load16_lane, u16, 7)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load16_lane7, simde_wasm_v128_load16_lane, u16, 7)
+ DEFINE_SIMD_LOAD_LANE(v128_load32_lane0, simde_wasm_v128_load32_lane, u32, 0)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load32_lane0, simde_wasm_v128_load32_lane, u32, 0)
+ DEFINE_SIMD_LOAD_LANE(v128_load32_lane1, simde_wasm_v128_load32_lane, u32, 1)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load32_lane1, simde_wasm_v128_load32_lane, u32, 1)
+ DEFINE_SIMD_LOAD_LANE(v128_load32_lane2, simde_wasm_v128_load32_lane, u32, 2)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load32_lane2, simde_wasm_v128_load32_lane, u32, 2)
+ DEFINE_SIMD_LOAD_LANE(v128_load32_lane3, simde_wasm_v128_load32_lane, u32, 3)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load32_lane3, simde_wasm_v128_load32_lane, u32, 3)
+ DEFINE_SIMD_LOAD_LANE(v128_load64_lane0, simde_wasm_v128_load64_lane, u64, 0)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load64_lane0, simde_wasm_v128_load64_lane, u64, 0)
+ DEFINE_SIMD_LOAD_LANE(v128_load64_lane1, simde_wasm_v128_load64_lane, u64, 1)
++DEFINE_SIMD_LOAD_LANE_SHARED(v128_load64_lane1, simde_wasm_v128_load64_lane, u64, 1)
+ #endif
+ 
+ DEFINE_SIMD_STORE(v128_store, v128)
++DEFINE_SIMD_STORE_SHARED(v128_store, v128)
+ 
+ #if WABT_BIG_ENDIAN
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane0, simde_wasm_v128_store8_lane, u8, 15)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane0, simde_wasm_v128_store8_lane, u8, 15)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane1, simde_wasm_v128_store8_lane, u8, 14)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane1, simde_wasm_v128_store8_lane, u8, 14)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane2, simde_wasm_v128_store8_lane, u8, 13)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane2, simde_wasm_v128_store8_lane, u8, 13)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane3, simde_wasm_v128_store8_lane, u8, 12)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane3, simde_wasm_v128_store8_lane, u8, 12)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane4, simde_wasm_v128_store8_lane, u8, 11)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane4, simde_wasm_v128_store8_lane, u8, 11)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane5, simde_wasm_v128_store8_lane, u8, 10)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane5, simde_wasm_v128_store8_lane, u8, 10)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane6, simde_wasm_v128_store8_lane, u8, 9)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane6, simde_wasm_v128_store8_lane, u8, 9)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane7, simde_wasm_v128_store8_lane, u8, 8)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane7, simde_wasm_v128_store8_lane, u8, 8)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane8, simde_wasm_v128_store8_lane, u8, 7)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane8, simde_wasm_v128_store8_lane, u8, 7)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane9, simde_wasm_v128_store8_lane, u8, 6)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane9, simde_wasm_v128_store8_lane, u8, 6)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane10, simde_wasm_v128_store8_lane, u8, 5)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane10, simde_wasm_v128_store8_lane, u8, 5)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane11, simde_wasm_v128_store8_lane, u8, 4)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane11, simde_wasm_v128_store8_lane, u8, 4)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane12, simde_wasm_v128_store8_lane, u8, 3)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane12, simde_wasm_v128_store8_lane, u8, 3)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane13, simde_wasm_v128_store8_lane, u8, 2)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane13, simde_wasm_v128_store8_lane, u8, 2)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane14, simde_wasm_v128_store8_lane, u8, 1)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane14, simde_wasm_v128_store8_lane, u8, 1)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane15, simde_wasm_v128_store8_lane, u8, 0)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane15, simde_wasm_v128_store8_lane, u8, 0)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane0, simde_wasm_v128_store16_lane, u16, 7)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane0, simde_wasm_v128_store16_lane, u16, 7)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane1, simde_wasm_v128_store16_lane, u16, 6)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane1, simde_wasm_v128_store16_lane, u16, 6)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane2, simde_wasm_v128_store16_lane, u16, 5)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane2, simde_wasm_v128_store16_lane, u16, 5)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane3, simde_wasm_v128_store16_lane, u16, 4)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane3, simde_wasm_v128_store16_lane, u16, 4)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane4, simde_wasm_v128_store16_lane, u16, 3)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane4, simde_wasm_v128_store16_lane, u16, 3)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane5, simde_wasm_v128_store16_lane, u16, 2)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane5, simde_wasm_v128_store16_lane, u16, 2)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane6, simde_wasm_v128_store16_lane, u16, 1)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane6, simde_wasm_v128_store16_lane, u16, 1)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane7, simde_wasm_v128_store16_lane, u16, 0)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane7, simde_wasm_v128_store16_lane, u16, 0)
+ DEFINE_SIMD_STORE_LANE(v128_store32_lane0, simde_wasm_v128_store32_lane, u32, 3)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store32_lane0, simde_wasm_v128_store32_lane, u32, 3)
+ DEFINE_SIMD_STORE_LANE(v128_store32_lane1, simde_wasm_v128_store32_lane, u32, 2)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store32_lane1, simde_wasm_v128_store32_lane, u32, 2)
+ DEFINE_SIMD_STORE_LANE(v128_store32_lane2, simde_wasm_v128_store32_lane, u32, 1)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store32_lane2, simde_wasm_v128_store32_lane, u32, 1)
+ DEFINE_SIMD_STORE_LANE(v128_store32_lane3, simde_wasm_v128_store32_lane, u32, 0)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store32_lane3, simde_wasm_v128_store32_lane, u32, 0)
+ DEFINE_SIMD_STORE_LANE(v128_store64_lane0, simde_wasm_v128_store64_lane, u64, 1)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store64_lane0, simde_wasm_v128_store64_lane, u64, 1)
+ DEFINE_SIMD_STORE_LANE(v128_store64_lane1, simde_wasm_v128_store64_lane, u64, 0)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store64_lane1, simde_wasm_v128_store64_lane, u64, 0)
+ #else
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane0, simde_wasm_v128_store8_lane, u8, 0)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane0, simde_wasm_v128_store8_lane, u8, 0)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane1, simde_wasm_v128_store8_lane, u8, 1)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane1, simde_wasm_v128_store8_lane, u8, 1)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane2, simde_wasm_v128_store8_lane, u8, 2)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane2, simde_wasm_v128_store8_lane, u8, 2)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane3, simde_wasm_v128_store8_lane, u8, 3)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane3, simde_wasm_v128_store8_lane, u8, 3)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane4, simde_wasm_v128_store8_lane, u8, 4)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane4, simde_wasm_v128_store8_lane, u8, 4)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane5, simde_wasm_v128_store8_lane, u8, 5)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane5, simde_wasm_v128_store8_lane, u8, 5)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane6, simde_wasm_v128_store8_lane, u8, 6)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane6, simde_wasm_v128_store8_lane, u8, 6)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane7, simde_wasm_v128_store8_lane, u8, 7)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane7, simde_wasm_v128_store8_lane, u8, 7)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane8, simde_wasm_v128_store8_lane, u8, 8)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane8, simde_wasm_v128_store8_lane, u8, 8)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane9, simde_wasm_v128_store8_lane, u8, 9)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane9, simde_wasm_v128_store8_lane, u8, 9)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane10, simde_wasm_v128_store8_lane, u8, 10)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane10, simde_wasm_v128_store8_lane, u8, 10)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane11, simde_wasm_v128_store8_lane, u8, 11)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane11, simde_wasm_v128_store8_lane, u8, 11)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane12, simde_wasm_v128_store8_lane, u8, 12)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane12, simde_wasm_v128_store8_lane, u8, 12)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane13, simde_wasm_v128_store8_lane, u8, 13)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane13, simde_wasm_v128_store8_lane, u8, 13)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane14, simde_wasm_v128_store8_lane, u8, 14)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane14, simde_wasm_v128_store8_lane, u8, 14)
+ DEFINE_SIMD_STORE_LANE(v128_store8_lane15, simde_wasm_v128_store8_lane, u8, 15)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store8_lane15, simde_wasm_v128_store8_lane, u8, 15)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane0, simde_wasm_v128_store16_lane, u16, 0)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane0, simde_wasm_v128_store16_lane, u16, 0)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane1, simde_wasm_v128_store16_lane, u16, 1)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane1, simde_wasm_v128_store16_lane, u16, 1)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane2, simde_wasm_v128_store16_lane, u16, 2)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane2, simde_wasm_v128_store16_lane, u16, 2)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane3, simde_wasm_v128_store16_lane, u16, 3)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane3, simde_wasm_v128_store16_lane, u16, 3)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane4, simde_wasm_v128_store16_lane, u16, 4)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane4, simde_wasm_v128_store16_lane, u16, 4)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane5, simde_wasm_v128_store16_lane, u16, 5)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane5, simde_wasm_v128_store16_lane, u16, 5)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane6, simde_wasm_v128_store16_lane, u16, 6)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane6, simde_wasm_v128_store16_lane, u16, 6)
+ DEFINE_SIMD_STORE_LANE(v128_store16_lane7, simde_wasm_v128_store16_lane, u16, 7)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store16_lane7, simde_wasm_v128_store16_lane, u16, 7)
+ DEFINE_SIMD_STORE_LANE(v128_store32_lane0, simde_wasm_v128_store32_lane, u32, 0)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store32_lane0, simde_wasm_v128_store32_lane, u32, 0)
+ DEFINE_SIMD_STORE_LANE(v128_store32_lane1, simde_wasm_v128_store32_lane, u32, 1)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store32_lane1, simde_wasm_v128_store32_lane, u32, 1)
+ DEFINE_SIMD_STORE_LANE(v128_store32_lane2, simde_wasm_v128_store32_lane, u32, 2)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store32_lane2, simde_wasm_v128_store32_lane, u32, 2)
+ DEFINE_SIMD_STORE_LANE(v128_store32_lane3, simde_wasm_v128_store32_lane, u32, 3)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store32_lane3, simde_wasm_v128_store32_lane, u32, 3)
+ DEFINE_SIMD_STORE_LANE(v128_store64_lane0, simde_wasm_v128_store64_lane, u64, 0)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store64_lane0, simde_wasm_v128_store64_lane, u64, 0)
+ DEFINE_SIMD_STORE_LANE(v128_store64_lane1, simde_wasm_v128_store64_lane, u64, 1)
++DEFINE_SIMD_STORE_LANE_SHARED(v128_store64_lane1, simde_wasm_v128_store64_lane, u64, 1)
+ #endif
+ 
+ #if WABT_BIG_ENDIAN
+-- 
+2.50.1 (Apple Git-155)
+

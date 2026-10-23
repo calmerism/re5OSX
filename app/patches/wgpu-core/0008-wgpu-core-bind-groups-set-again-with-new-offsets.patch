@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:00:00 +0200
+Subject: [PATCH] wgpu-core: a bind group set again with new offsets costs only them
+
+A renderer that keeps its constants in one ring buffer sets its bind
+groups again at almost every draw, the same groups with other dynamic
+offsets. Each time the group was added to the tracker and merged into
+the usage scope again, every group from its index up was set again (so
+group 1 with group 0), and each of those had its memory init actions
+taken and its resources checked. A group set again in the same pass now
+only has its offsets validated and taken, and only it is set again; the
+init actions and checks are those of its first set in the pass (the
+snatch guard is held through the encoding, the binder is per pass).
+---
+diff --git a/src/command/bind.rs b/src/command/bind.rs
+index 0cd00ef..ba4f93b 100644
+--- a/src/command/bind.rs
++++ b/src/command/bind.rs
+@@ -193,6 +193,10 @@ mod compat {
+     pub(super) struct BoundBindGroupLayouts {
+         entries: [Entry; hal::MAX_BIND_GROUPS],
+         rebind_start: usize,
++        /// The groups to set again, a bit per index: those assigned, and all
++        /// from where the layouts changed (render and compute passes; render
++        /// bundles go by `rebind_start`).
++        rebind: u8,
+     }
+ 
+     impl BoundBindGroupLayouts {
+@@ -200,6 +204,7 @@ mod compat {
+             Self {
+                 entries: [const { Entry::empty() }; hal::MAX_BIND_GROUPS],
+                 rebind_start: 0,
++                rebind: 0,
+             }
+         }
+ 
+@@ -212,6 +217,22 @@ mod compat {
+ 
+         pub fn update_rebind_start_index(&mut self, start_index: usize) {
+             self.rebind_start = self.rebind_start.min(start_index);
++            self.rebind |= u8::MAX.checked_shl(start_index as u32).unwrap_or(0);
++        }
++
++        /// Takes the groups to set again (see `rebind`), and clears them.
++        pub fn take_rebind(&mut self) -> u8 {
++            self.rebind_start = self.entries.len();
++            core::mem::take(&mut self.rebind)
++        }
++
++        /// The group at `index` is to be set again, and only it: a group
++        /// set at one index leaves those at the others bound (Vulkan keeps
++        /// sets bound with layouts compatible up to theirs, and the layouts
++        /// did not change).
++        pub fn rebind(&mut self, index: usize) {
++            self.rebind_start = self.rebind_start.min(index);
++            self.rebind |= 1 << index;
+         }
+ 
+         pub fn update_expectations(&mut self, expectations: &[Option<Arc<BindGroupLayout>>]) {
+@@ -247,7 +268,7 @@ mod compat {
+ 
+         pub fn assign(&mut self, index: usize, value: Arc<BindGroupLayout>) {
+             self.entries[index].assigned = Some(value);
+-            self.update_rebind_start_index(index);
++            self.rebind(index);
+         }
+ 
+         pub fn clear(&mut self, index: usize) {
+@@ -335,6 +356,11 @@ pub(super) struct Binder {
+     pub(super) pipeline_layout: Option<Arc<PipelineLayout>>,
+     manager: compat::BoundBindGroupLayouts,
+     payloads: [EntryPayload; hal::MAX_BIND_GROUPS],
++    /// The groups assigned since they were last set on the raw encoder, a
++    /// bit per index: their memory init actions are still to be taken, and
++    /// their resources checked. (A group set again with other dynamic
++    /// offsets is not: see [`Binder::assign_offsets`].)
++    new_groups: u8,
+ }
+ 
+ impl Binder {
+@@ -343,11 +369,13 @@ impl Binder {
+             pipeline_layout: None,
+             manager: compat::BoundBindGroupLayouts::new(),
+             payloads: Default::default(),
++            new_groups: 0,
+         }
+     }
+     pub(super) fn reset(&mut self) {
+         self.pipeline_layout = None;
+         self.manager = compat::BoundBindGroupLayouts::new();
++        self.new_groups = 0;
+         for payload in self.payloads.iter_mut() {
+             payload.reset();
+         }
+@@ -388,6 +416,7 @@ impl Binder {
+         bind_group: &Arc<BindGroup>,
+         offsets: &[wgt::DynamicOffset],
+     ) {
++        self.new_groups |= 1 << index;
+         let payload = &mut self.payloads[index];
+         payload.group = Some(bind_group.clone());
+         payload.dynamic_offsets.clear();
+@@ -423,6 +452,55 @@ impl Binder {
+         self.manager.assign(index, bind_group.layout.clone());
+     }
+ 
++    /// Whether `bind_group` is the group assigned at `index`.
++    pub(super) fn is_assigned(&self, index: usize, bind_group: &Arc<BindGroup>) -> bool {
++        self.payloads[index]
++            .group
++            .as_ref()
++            .is_some_and(|group| Arc::ptr_eq(group, bind_group))
++    }
++
++    /// New dynamic offsets for the group assigned at `index` (see
++    /// [`Self::is_assigned`]): only it is set again.
++    pub(super) fn assign_offsets(&mut self, index: usize, offsets: &[wgt::DynamicOffset]) {
++        let payload = &mut self.payloads[index];
++        payload.dynamic_offsets.clear();
++        payload.dynamic_offsets.extend_from_slice(offsets);
++        self.manager.rebind(index);
++    }
++
++    /// Takes the groups to set on the raw encoder before the next draw or
++    /// dispatch, a bit per index, and those of them that are new (see
++    /// `new_groups`; no longer new once taken). List them with
++    /// [`Self::list_rebind`].
++    pub(super) fn take_rebind(&mut self) -> (u8, u8) {
++        let rebind = self.manager.take_rebind();
++        let mut valid = 0u8;
++        for index in self.manager.list_valid() {
++            valid |= 1 << index;
++        }
++        let (rebind, new_groups) = (rebind & valid, self.new_groups & rebind & valid);
++        self.new_groups &= !rebind;
++        (rebind, new_groups)
++    }
++
++    /// The groups of `rebind` (see [`Self::take_rebind`]): index, group, dynamic offsets.
++    pub(super) fn list_rebind(
++        &self,
++        rebind: u8,
++    ) -> impl Iterator<Item = (usize, &Arc<BindGroup>, &[wgt::DynamicOffset])> + '_ {
++        (0..hal::MAX_BIND_GROUPS)
++            .filter(move |&index| rebind >> index & 1 != 0)
++            .map(move |index| {
++                let payload = &self.payloads[index];
++                (
++                    index,
++                    payload.group.as_ref().unwrap(),
++                    payload.dynamic_offsets.as_slice(),
++                )
++            })
++    }
++
+     pub(super) fn clear_group(&mut self, index: usize) {
+         self.payloads[index].reset();
+         self.manager.clear(index);
+diff --git a/src/command/pass.rs b/src/command/pass.rs
+index fd90492..2b762e9 100644
+--- a/src/command/pass.rs
++++ b/src/command/pass.rs
+@@ -97,7 +97,16 @@ where
+     );
+     state.dynamic_offset_count += num_dynamic_offsets;
+ 
+-    if let Some(bind_group) = bind_group {
++    if let Some(bind_group) = bind_group.as_ref().filter(|group| state.binder.is_assigned(index as usize, group)) {
++        // re5osx: the group set again with other dynamic offsets (constants
++        // in a ring buffer move at every draw) was added to the tracker and
++        // merged into the usage scope when it was set, in this pass: merging
++        // it again changes nothing. Only its offsets are taken.
++        bind_group.validate_dynamic_bindings(index, &state.temp_offsets)?;
++        state
++            .binder
++            .assign_offsets(index as usize, &state.temp_offsets);
++    } else if let Some(bind_group) = bind_group {
+         // Add the bind group to the tracker. This is done for both compute and
+         // render passes, and is used to fail submission of the command buffer if
+         // any resource in any of the bind groups has been destroyed, whether or
+@@ -142,11 +151,33 @@ where
+ /// See the compute pass version of `State::flush_bindings` for an explanation
+ /// of some differences in handling the two types of passes.
+ pub(super) fn flush_bindings_helper(state: &mut PassState) -> Result<(), DestroyedResourceError> {
+-    let start = state.binder.take_rebind_start_index();
+-    let entries = state.binder.list_valid_with_start(start);
++    let (rebind, new_groups) = state.binder.take_rebind();
++    let entries = state.binder.list_rebind(rebind);
+     let pipeline_layout = state.binder.pipeline_layout.as_ref().unwrap();
+ 
+     for (i, bind_group, dynamic_offsets) in entries {
++        let new = new_groups >> i & 1 != 0;
++        // re5osx: a group set again in this pass (new dynamic offsets, a
++        // pipeline with other layouts) had its init actions taken and its
++        // resources checked when it was first set: the snatch guard held
++        // through the encoding, none can have been destroyed since.
++        if !new {
++            let raw_bg = bind_group
++                .raw
++                .get(state.base.snatch_guard)
++                .ok_or_else(|| DestroyedResourceError(bind_group.error_ident()))?;
++            unsafe {
++                state.base.raw_encoder.set_bind_group(
++                    pipeline_layout
++                        .raw()
++                        .expect("Pipeline layout should be valid at this point"),
++                    i as u32,
++                    raw_bg.as_ref(),
++                    dynamic_offsets,
++                );
++            }
++            continue;
++        }
+         state.base.buffer_memory_init_actions.extend(
+             bind_group.buffer_init_actions.iter().filter_map(|action| {
+                 action
+-- 
+2.50.1
+

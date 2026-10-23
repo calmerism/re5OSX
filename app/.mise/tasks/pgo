@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#MISE description="Profile the game for PGO: an instrumented build runs the engine's benchmark headless, its profile merged into target/re5osx-tools/pgo/game.profdata (then build with RE5OSX_GAME_PGO=<that file>)"
+#MISE depends=["setup"]
+set -euo pipefail
+dir="$PWD/target/re5osx-tools/pgo"
+rm -rf "$dir/raw"
+mkdir -p "$dir/raw"
+RE5OSX_GAME_PGO=generate LLVM_PROFILE_FILE="$dir/raw/game_%p.profraw" \
+    RE5OSX_ENGINE_ARGS="-benchmark -benchmarkIterations=1" cargo run -r --example headless
+if command -v xcrun >/dev/null; then profdata=(xcrun llvm-profdata); else profdata=(llvm-profdata); fi
+"${profdata[@]}" merge -o "$dir/game.profdata" "$dir"/raw/*.profraw
+rm -rf "$dir/raw"
+# The functions run, the busiest first (by their blocks' counts): the build
+# gathers them into files of their own (crates/re5osx-game/build/hot.rs).
+"${profdata[@]}" show --all-functions --counts "$dir/game.profdata" |
+    awk '/^  [^ ].*:$/ { name = substr($0, 3, length($0) - 3) }
+        /Block counts:/ { gsub(/[^0-9,]/, ""); n = split($0, c, ","); s = 0; for (i = 1; i <= n; i++) s += c[i]; if (s > 0) print s, name }' |
+    sort -rn | awk '{ print $2 }' >"$dir/hot.txt"
+echo "profile: $dir/game.profdata ($(wc -l <"$dir/hot.txt") functions run)"

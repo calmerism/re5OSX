@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Every translated shader through the adapter and naga's validator"
+#MISE depends=["setup"]
+#USAGE arg "[args]..." var=#true help="Passed on to the test binary"
+exec cargo test -r -p re5osx-gpu -- --ignored "$@"

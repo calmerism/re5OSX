@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Tests (every translated shader too: mise run test:shaders)"
+#MISE depends=["setup"]
+#USAGE arg "[args]..." var=#true help="Passed on to cargo test (e.g. a test name filter)"
+exec cargo test --workspace "$@"

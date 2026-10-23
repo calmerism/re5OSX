@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:00:00 +0200
+Subject: [PATCH] wgpu-hal: Metal: bind groups set again move only their offsets
+
+A bind group set again at the same index with the same pipeline layout
+in a pass has its textures, samplers and buffers in place already: only
+its dynamic buffers' offsets are set (setVertexBufferOffset and the
+like), not every resource again (each one also an addition to the
+command buffer's resource list).
+---
+diff --git a/src/metal/command.rs b/src/metal/command.rs
+index 0d0d2ba..ff8fe91 100644
+--- a/src/metal/command.rs
++++ b/src/metal/command.rs
+@@ -23,7 +23,11 @@ use alloc::{
+     sync::Arc,
+     vec::Vec,
+ };
+-use core::{ops::Range, ptr::NonNull, sync::atomic};
++use core::{
++    ops::Range,
++    ptr::{self, NonNull},
++    sync::atomic,
++};
+ use smallvec::SmallVec;
+ 
+ // has to match `Temp::binding_sizes`
+@@ -43,6 +47,8 @@ impl Default for super::CommandState {
+             vertex_buffer_size_map: Default::default(),
+             immediates: Vec::new(),
+             pending_timer_queries: Vec::new(),
++            bound_groups: [0; crate::MAX_BIND_GROUPS],
++            bound_layout: 0,
+         }
+     }
+ }
+@@ -351,6 +357,53 @@ impl super::CommandEncoder {
+         self.leave_acceleration_structure_builder();
+     }
+ 
++    /// Sets the offsets of `group`'s dynamic buffers, the group being bound
++    /// already (see `set_bind_group`).
++    fn update_bind_group_offsets(
++        &self,
++        bg_info: &super::BindGroupLayoutInfo,
++        dynamic_offsets: &[wgt::DynamicOffset],
++        group: &super::BindGroup,
++    ) {
++        let offset = |res: &super::BufferLikeResource| match *res {
++            super::BufferLikeResource::Buffer {
++                offset,
++                dynamic_index: Some(dyn_index),
++                ..
++            } => Some((offset + dynamic_offsets[dyn_index as usize] as wgt::BufferAddress) as usize),
++            _ => None,
++        };
++        let (counters, base) = (&group.counters, &bg_info.base_resource_indices);
++        if let Some(encoder) = self.state.render.as_ref() {
++            // Buffers by stage, as `update_bind_group_state` takes them.
++            for index in 0..counters.vs.buffers {
++                if let Some(offset) = offset(&group.buffers[index as usize]) {
++                    let slot = (base.vs.buffers + index) as usize;
++                    unsafe { encoder.setVertexBufferOffset_atIndex(offset, slot) };
++                }
++            }
++            let first = counters.vs.buffers + counters.ts.buffers + counters.ms.buffers;
++            for index in 0..counters.fs.buffers {
++                if let Some(offset) = offset(&group.buffers[(first + index) as usize]) {
++                    let slot = (base.fs.buffers + index) as usize;
++                    unsafe { encoder.setFragmentBufferOffset_atIndex(offset, slot) };
++                }
++            }
++        }
++        if let Some(encoder) = self.state.compute.as_ref() {
++            let first = counters.vs.buffers
++                + counters.ts.buffers
++                + counters.ms.buffers
++                + counters.fs.buffers;
++            for index in 0..counters.cs.buffers {
++                if let Some(offset) = offset(&group.buffers[(first + index) as usize]) {
++                    let slot = (base.cs.buffers + index) as usize;
++                    unsafe { encoder.setBufferOffset_atIndex(offset, slot) };
++                }
++            }
++        }
++    }
++
+     /// Updates the bindings for a single shader stage, called in `set_bind_group`.
+     fn update_bind_group_state(
+         &mut self,
+@@ -475,6 +528,8 @@ impl super::CommandEncoder {
+ 
+ impl super::CommandState {
+     fn reset(&mut self) {
++        self.bound_groups = [0; crate::MAX_BIND_GROUPS];
++        self.bound_layout = 0;
+         self.storage_buffer_length_map.clear();
+         self.vertex_buffer_size_map.clear();
+         self.stage_infos.vs.clear();
+@@ -1162,6 +1217,26 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         let bg_info = layout.bind_group_infos[group_index as usize]
+             .as_ref()
+             .unwrap();
++        // The group bound at this index with this layout in this encoder:
++        // its textures, samplers and buffers are in place, only the offsets
++        // of its dynamic buffers change (constants in a ring buffer, set
++        // again at every draw). Within one layout the groups' slots do not
++        // overlap, and nothing else sets them.
++        let layout_key = ptr::from_ref(layout) as usize;
++        if self.state.bound_layout != layout_key {
++            self.state.bound_groups = [0; crate::MAX_BIND_GROUPS];
++            self.state.bound_layout = layout_key;
++        }
++        let group_key = ptr::from_ref(group) as usize;
++        let counters = &group.counters;
++        if self.state.bound_groups[group_index as usize] == group_key
++            && counters.ts.buffers == 0
++            && counters.ms.buffers == 0
++        {
++            self.update_bind_group_offsets(bg_info, dynamic_offsets, group);
++            return;
++        }
++        self.state.bound_groups[group_index as usize] = group_key;
+         let render_encoder = self.state.render.clone();
+         let compute_encoder = self.state.compute.clone();
+         if let Some(encoder) = render_encoder {
+diff --git a/src/metal/mod.rs b/src/metal/mod.rs
+index 9aff218..e6d9427 100644
+--- a/src/metal/mod.rs
++++ b/src/metal/mod.rs
+@@ -1351,6 +1351,12 @@ struct CommandState {
+ 
+     /// Timer query that should be executed when the next pass starts.
+     pending_timer_queries: Vec<(QuerySet, u32)>,
++
++    /// The bind group set at each index in the current pass, and the
++    /// pipeline layout they were set with (addresses: identities only).
++    /// Setting the same group again only moves its dynamic buffers.
++    bound_groups: [usize; crate::MAX_BIND_GROUPS],
++    bound_layout: usize,
+ }
+ 
+ // Any state in this struct that may be dirty after an abandoned encoding must
+-- 
+2.50.1
+

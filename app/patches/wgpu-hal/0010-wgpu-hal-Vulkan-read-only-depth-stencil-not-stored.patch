@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:00:00 +0200
+Subject: [PATCH] wgpu-hal: Vulkan read-only depth-stencil not stored
+
+A pass with read-only depth and stencil (the DEPTH_STENCIL_READ_ONLY
+layout, which wgpu-core uses only when both aspects are read-only) had
+STORE ops: a tiling GPU writes the attachment back for every tile the
+pass touches although nothing changed it (Mali's transaction elimination
+covers colour only). With VK_ATTACHMENT_STORE_OP_NONE (Vulkan 1.3 or
+VK_KHR/EXT_load_store_op_none, enabled when present) memory stays as it
+was. Store ops do not change render pass compatibility.
+---
+diff --git a/src/vulkan/adapter.rs b/src/vulkan/adapter.rs
+index 36c021a..606fcee 100644
+--- a/src/vulkan/adapter.rs
++++ b/src/vulkan/adapter.rs
+@@ -1305,6 +1305,13 @@ impl PhysicalDeviceProperties {
+         }
+ 
+         if self.device_api_version < vk::API_VERSION_1_3 {
++            // Optional `VK_KHR_load_store_op_none` or `VK_EXT_load_store_op_none`
++            if self.supports_extension(khr::load_store_op_none::NAME) {
++                extensions.push(khr::load_store_op_none::NAME);
++            } else if self.supports_extension(ext::load_store_op_none::NAME) {
++                extensions.push(ext::load_store_op_none::NAME);
++            }
++
+             // Optional `VK_KHR_maintenance4`
+             if self.supports_extension(khr::maintenance4::NAME) {
+                 extensions.push(khr::maintenance4::NAME);
+@@ -2421,6 +2428,9 @@ impl super::Instance {
+                 depth_stencil_required_flags(),
+             ),
+             multi_draw_indirect: phd_features.core.multi_draw_indirect != 0,
++            store_op_none: phd_capabilities.device_api_version >= vk::API_VERSION_1_3
++                || phd_capabilities.supports_extension(khr::load_store_op_none::NAME)
++                || phd_capabilities.supports_extension(ext::load_store_op_none::NAME),
+             max_draw_indirect_count: phd_capabilities.properties.limits.max_draw_indirect_count,
+             precise_occlusion_query: phd_features.core.occlusion_query_precise != 0,
+             non_coherent_map_mask: phd_capabilities.properties.limits.non_coherent_atom_size - 1,
+diff --git a/src/vulkan/device.rs b/src/vulkan/device.rs
+index 122dda9..4538605 100644
+--- a/src/vulkan/device.rs
++++ b/src/vulkan/device.rs
+@@ -169,8 +169,17 @@ impl super::DeviceShared {
+                         attachment: vk_attachments.len() as u32,
+                         layout,
+                     });
+-                    let (load_op, store_op) = conv::map_attachment_ops(ops);
+-                    let (stencil_load_op, stencil_store_op) = conv::map_attachment_ops(stencil_ops);
++                    let (load_op, mut store_op) = conv::map_attachment_ops(ops);
++                    let (stencil_load_op, mut stencil_store_op) = conv::map_attachment_ops(stencil_ops);
++                    // Read-only depth and stencil (wgpu-core asks for this
++                    // layout only then): nothing to write back, which a
++                    // tiler would still do for STORE.
++                    if layout == vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
++                        && self.private_caps.store_op_none
++                    {
++                        store_op = vk::AttachmentStoreOp::NONE;
++                        stencil_store_op = vk::AttachmentStoreOp::NONE;
++                    }
+                     let vk_attachment = vk::AttachmentDescription::default()
+                         .format(format)
+                         .samples(samples)
+diff --git a/src/vulkan/mod.rs b/src/vulkan/mod.rs
+index 5a4e953..35a1e1a 100644
+--- a/src/vulkan/mod.rs
++++ b/src/vulkan/mod.rs
+@@ -349,6 +349,8 @@ struct PrivateCapabilities {
+     non_coherent_map_mask: wgt::BufferAddress,
+     multi_draw_indirect: bool,
+     max_draw_indirect_count: u32,
++    /// `VK_ATTACHMENT_STORE_OP_NONE` (Vulkan 1.3, or `VK_KHR`/`VK_EXT_load_store_op_none`).
++    store_op_none: bool,
+ 
+     /// True if this adapter supports the [`occlusionQueryPrecise`][oqp]
+     /// feature: occlusion queries then count the samples that pass instead

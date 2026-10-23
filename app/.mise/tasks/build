@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Build the desktop app"
+#MISE depends=["setup"]
+#USAGE arg "[args]..." var=#true help="Passed on to cargo build"
+exec cargo build -r "$@"

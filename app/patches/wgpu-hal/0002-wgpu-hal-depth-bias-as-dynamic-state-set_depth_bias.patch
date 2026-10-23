@@ -1,0 +1,241 @@
+From e712ed1f4d5a71427be3a0c180d3be85d99fcbc6 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 17:05:52 +0200
+Subject: [PATCH] wgpu-hal: depth bias as dynamic state (set_depth_bias)
+
+A render pass can set the depth bias of the triangles drawn with a
+depth-stencil attachment, in place of their pipeline's own: pipelines
+that differ only in their depth bias can be one. D3D11 has the bias in
+its rasterizer state, and a game translated onto wgpu (re5osx) uses
+about two hundred for its shadows (by cascade and light): with the bias
+in the pipeline, each made another pipeline to compile, three quarters
+of all its pipelines. DXVK makes the bias dynamic for the same reason.
+
+CommandEncoder::set_depth_bias sets it until the next pipeline (binding
+a pipeline sets its own, as before). Metal already set the bias on the
+encoder from the pipeline; Vulkan pipelines of triangles with a
+depth-stencil attachment now have it as dynamic state
+(VK_DYNAMIC_STATE_DEPTH_BIAS, depthBiasEnable on), set from the pipeline
+when bound; GLES already had a command for it. D3D12 would need
+ID3D12GraphicsCommandList9 and pipelines made for it: not implemented,
+its pipelines keep their own bias.
+
+---
+ src/dx12/command.rs    |  7 +++++++
+ src/dynamic/command.rs |  7 +++++++
+ src/gles/command.rs    |  6 ++++++
+ src/lib.rs             |  3 +++
+ src/metal/command.rs   |  4 ++++
+ src/noop/command.rs    |  1 +
+ src/vulkan/command.rs  | 13 +++++++++++++
+ src/vulkan/device.rs   | 21 ++++++++++++++-------
+ src/vulkan/mod.rs      |  2 ++
+ 9 files changed, 57 insertions(+), 7 deletions(-)
+
+diff --git a/src/dx12/command.rs b/src/dx12/command.rs
+index 9e90e26..26679c5 100644
+--- a/src/dx12/command.rs
++++ b/src/dx12/command.rs
+@@ -1320,6 +1320,13 @@ impl crate::CommandEncoder for super::CommandEncoder {
+     unsafe fn set_stencil_reference(&mut self, value: u32) {
+         unsafe { self.list.as_ref().unwrap().OMSetStencilRef(value) }
+     }
++    unsafe fn set_depth_bias(&mut self, _bias: &wgt::DepthBiasState) {
++        // Not implemented: D3D12 sets it from a command list only with
++        // ID3D12GraphicsCommandList9 and pipelines made for it. Triangles
++        // keep their pipeline's depth bias.
++        static WARNED: std::sync::Once = std::sync::Once::new();
++        WARNED.call_once(|| log::warn!("set_depth_bias is not implemented on D3D12"));
++    }
+     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
+         unsafe { self.list.as_ref().unwrap().OMSetBlendFactor(Some(color)) }
+     }
+diff --git a/src/dynamic/command.rs b/src/dynamic/command.rs
+index aca5bbc..85b80a8 100644
+--- a/src/dynamic/command.rs
++++ b/src/dynamic/command.rs
+@@ -113,6 +113,7 @@ pub trait DynCommandEncoder: DynResource + core::fmt::Debug {
+     unsafe fn set_viewport(&mut self, rect: &Rect<f32>, depth_range: Range<f32>);
+     unsafe fn set_scissor_rect(&mut self, rect: &Rect<u32>);
+     unsafe fn set_stencil_reference(&mut self, value: u32);
++    unsafe fn set_depth_bias(&mut self, bias: &wgt::DepthBiasState);
+     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]);
+ 
+     unsafe fn draw(
+@@ -464,6 +465,12 @@ impl<C: CommandEncoder + DynResource> DynCommandEncoder for C {
+         }
+     }
+ 
++    unsafe fn set_depth_bias(&mut self, bias: &wgt::DepthBiasState) {
++        unsafe {
++            C::set_depth_bias(self, bias);
++        }
++    }
++
+     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
+         unsafe { C::set_blend_constants(self, color) };
+     }
+diff --git a/src/gles/command.rs b/src/gles/command.rs
+index 427551c..9e6f9af 100644
+--- a/src/gles/command.rs
++++ b/src/gles/command.rs
+@@ -1068,6 +1068,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         self.state.stencil.back.reference = value;
+         self.rebind_stencil_func();
+     }
++    unsafe fn set_depth_bias(&mut self, bias: &wgt::DepthBiasState) {
++        if *bias != self.state.depth_bias {
++            self.state.depth_bias = *bias;
++            self.cmd_buffer.commands.push(C::SetDepthBias(*bias));
++        }
++    }
+     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
+         self.cmd_buffer.commands.push(C::SetBlendConstant(*color));
+     }
+diff --git a/src/lib.rs b/src/lib.rs
+index ca626f2..711d88e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1667,6 +1667,9 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
+     unsafe fn set_viewport(&mut self, rect: &Rect<f32>, depth_range: Range<f32>);
+     unsafe fn set_scissor_rect(&mut self, rect: &Rect<u32>);
+     unsafe fn set_stencil_reference(&mut self, value: u32);
++    /// The depth bias of the triangles drawn with a depth-stencil attachment
++    /// until the next pipeline is set (binding a pipeline sets its own).
++    unsafe fn set_depth_bias(&mut self, bias: &wgt::DepthBiasState);
+     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]);
+ 
+     unsafe fn draw(
+diff --git a/src/metal/command.rs b/src/metal/command.rs
+index 40106d6..d06309f 100644
+--- a/src/metal/command.rs
++++ b/src/metal/command.rs
+@@ -1484,6 +1484,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         let encoder = self.state.render.as_ref().unwrap();
+         encoder.setStencilFrontReferenceValue_backReferenceValue(value, value);
+     }
++    unsafe fn set_depth_bias(&mut self, bias: &wgt::DepthBiasState) {
++        let encoder = self.state.render.as_ref().unwrap();
++        encoder.setDepthBias_slopeScale_clamp(bias.constant as f32, bias.slope_scale, bias.clamp);
++    }
+     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
+         let encoder = self.state.render.as_ref().unwrap();
+         encoder.setBlendColorRed_green_blue_alpha(color[0], color[1], color[2], color[3]);
+diff --git a/src/noop/command.rs b/src/noop/command.rs
+index 16cca58..011524e 100644
+--- a/src/noop/command.rs
++++ b/src/noop/command.rs
+@@ -185,6 +185,7 @@ impl crate::CommandEncoder for CommandBuffer {
+     unsafe fn set_viewport(&mut self, rect: &crate::Rect<f32>, depth_range: Range<f32>) {}
+     unsafe fn set_scissor_rect(&mut self, rect: &crate::Rect<u32>) {}
+     unsafe fn set_stencil_reference(&mut self, value: u32) {}
++    unsafe fn set_depth_bias(&mut self, bias: &wgt::DepthBiasState) {}
+     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {}
+ 
+     unsafe fn draw(
+diff --git a/src/vulkan/command.rs b/src/vulkan/command.rs
+index cca6272..0ccb1cd 100644
+--- a/src/vulkan/command.rs
++++ b/src/vulkan/command.rs
+@@ -988,6 +988,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
+                 pipeline.raw,
+             )
+         };
++        if let Some(bias) = pipeline.depth_bias {
++            unsafe { self.set_depth_bias(&bias) };
++        }
+     }
+ 
+     unsafe fn set_index_buffer<'a>(
+@@ -1058,6 +1061,16 @@ impl crate::CommandEncoder for super::CommandEncoder {
+             )
+         };
+     }
++    unsafe fn set_depth_bias(&mut self, bias: &wgt::DepthBiasState) {
++        unsafe {
++            self.device.raw.cmd_set_depth_bias(
++                self.active,
++                bias.constant as f32,
++                bias.clamp,
++                bias.slope_scale,
++            )
++        };
++    }
+     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
+         unsafe { self.device.raw.cmd_set_blend_constants(self.active, color) };
+     }
+diff --git a/src/vulkan/device.rs b/src/vulkan/device.rs
+index a82e25f..9ff2c95 100644
+--- a/src/vulkan/device.rs
++++ b/src/vulkan/device.rs
+@@ -1932,12 +1932,22 @@ impl crate::Device for super::Device {
+             super::PipelineCache,
+         >,
+     ) -> Result<super::RenderPipeline, crate::PipelineError> {
++        // The depth bias is dynamic where it applies (triangles with a
++        // depth-stencil attachment): binding the pipeline sets its own,
++        // `set_depth_bias` another.
++        let depth_bias = desc
++            .depth_stencil
++            .as_ref()
++            .filter(|_| desc.primitive.topology.is_triangles())
++            .map(|ds| ds.bias);
+         let dynamic_states = [
+             vk::DynamicState::VIEWPORT,
+             vk::DynamicState::SCISSOR,
+             vk::DynamicState::BLEND_CONSTANTS,
+             vk::DynamicState::STENCIL_REFERENCE,
++            vk::DynamicState::DEPTH_BIAS,
+         ];
++        let dynamic_states = &dynamic_states[..if depth_bias.is_some() { 5 } else { 4 }];
+         let mut compatible_rp_key = super::RenderPassKey {
+             sample_count: desc.multisample.count,
+             multiview_mask: desc.multiview_mask,
+@@ -2078,12 +2088,8 @@ impl crate::Device for super::Device {
+                     .back(back);
+             }
+ 
+-            if ds.bias.is_enabled() {
+-                vk_rasterization = vk_rasterization
+-                    .depth_bias_enable(true)
+-                    .depth_bias_constant_factor(ds.bias.constant as f32)
+-                    .depth_bias_clamp(ds.bias.clamp)
+-                    .depth_bias_slope_factor(ds.bias.slope_scale);
++            if depth_bias.is_some() {
++                vk_rasterization = vk_rasterization.depth_bias_enable(true);
+             }
+         }
+ 
+@@ -2142,7 +2148,7 @@ impl crate::Device for super::Device {
+             vk::PipelineColorBlendStateCreateInfo::default().attachments(&vk_attachments);
+ 
+         let vk_dynamic_state =
+-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
++            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(dynamic_states);
+ 
+         let raw_pass = self.shared.make_render_pass(compatible_rp_key)?;
+ 
+@@ -2215,6 +2221,7 @@ impl crate::Device for super::Device {
+         Ok(super::RenderPipeline {
+             raw,
+             is_multiview: desc.multiview_mask.is_some(),
++            depth_bias,
+         })
+     }
+ 
+diff --git a/src/vulkan/mod.rs b/src/vulkan/mod.rs
+index 60f20ec..fa0b888 100644
+--- a/src/vulkan/mod.rs
++++ b/src/vulkan/mod.rs
+@@ -1165,6 +1165,8 @@ impl crate::DynShaderModule for ShaderModule {}
+ pub struct RenderPipeline {
+     raw: vk::Pipeline,
+     is_multiview: bool,
++    /// Its depth bias, dynamic state (see `create_render_pipeline`).
++    depth_bias: Option<wgt::DepthBiasState>,
+ }
+ 
+ impl crate::DynRenderPipeline for RenderPipeline {}
+-- 
+2.50.1 (Apple Git-155)
+

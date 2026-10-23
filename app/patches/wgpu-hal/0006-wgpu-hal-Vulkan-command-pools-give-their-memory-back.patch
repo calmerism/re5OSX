@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 16:40:00 +0200
+Subject: [PATCH] wgpu-hal: Vulkan command pools give their memory back every
+ 16th reset
+
+vkResetCommandPool without RELEASE_RESOURCES keeps the memory the pool's
+command buffers took, for their next use. wgpu-core hands its pooled
+encoders to whichever command encoder comes next, so each pool ends up
+holding what its largest use ever needed: on a Pixel 8a (Mali-G715) the
+driver's GPU memory past what the allocator had reserved was ~420 MB in a
+game, ~160 MB with RELEASE_RESOURCES. Releasing at every reset made
+recording slower; every 16th reset bounds what a pool keeps to its recent
+uses at a small cost.
+---
+diff --git a/src/vulkan/command.rs b/src/vulkan/command.rs
+index e0ef63b..69223d6 100644
+--- a/src/vulkan/command.rs
++++ b/src/vulkan/command.rs
+@@ -205,14 +205,23 @@ impl crate::CommandEncoder for super::CommandEncoder {
+                 unsafe { self.device.raw.destroy_command_pool(self.raw, None) };
+                 self.raw = raw;
+                 self.free.clear();
++                self.resets = 0;
+                 return;
+             }
+         }
+-        let _ = unsafe {
+-            self.device
+-                .raw
+-                .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default())
++        // A reset keeps the memory the pool's command buffers took, for
++        // their next use; every 16th gives it back. Otherwise each pool
++        // holds what its largest use ever needed (on Mali, 250-300 MB of
++        // command memory across a game's pools); giving it back at every
++        // reset made recording slower.
++        self.resets += 1;
++        let flags = if self.resets >= 16 {
++            self.resets = 0;
++            vk::CommandPoolResetFlags::RELEASE_RESOURCES
++        } else {
++            vk::CommandPoolResetFlags::default()
+         };
++        let _ = unsafe { self.device.raw.reset_command_pool(self.raw, flags) };
+     }
+ 
+     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
+diff --git a/src/vulkan/device.rs b/src/vulkan/device.rs
+index 3a10fb7..122dda9 100644
+--- a/src/vulkan/device.rs
++++ b/src/vulkan/device.rs
+@@ -1401,6 +1401,7 @@ impl crate::Device for super::Device {
+             temp_texture_views: Default::default(),
+             counters: Arc::clone(&self.counters),
+             current_pipeline_is_multiview: false,
++            resets: 0,
+         })
+     }
+ 
+diff --git a/src/vulkan/mod.rs b/src/vulkan/mod.rs
+index 37eb9a5..5a4e953 100644
+--- a/src/vulkan/mod.rs
++++ b/src/vulkan/mod.rs
+@@ -1095,6 +1095,9 @@ pub struct CommandEncoder {
+     counters: Arc<wgt::HalCounters>,
+ 
+     current_pipeline_is_multiview: bool,
++
++    /// Resets of the pool since it last released its memory.
++    resets: u32,
+ }
+ 
+ impl Drop for CommandEncoder {
+-- 
+2.50.1

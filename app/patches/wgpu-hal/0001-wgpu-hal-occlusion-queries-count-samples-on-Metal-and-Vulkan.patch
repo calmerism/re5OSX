@@ -1,0 +1,194 @@
+From b1e2c794503389d117dc425134d63a95e552d4dc Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 16:56:33 +0200
+Subject: [PATCH 1/1] wgpu-hal: occlusion queries count samples on Metal and
+ Vulkan
+
+Metal began occlusion queries in MTLVisibilityResultModeBoolean and
+Vulkan without VK_QUERY_CONTROL_PRECISE_BIT, so a query that passed
+reported 1 (or any non-zero value) instead of the number of samples.
+WebGPU allows that, but D3D11 occlusion queries, which re5osx translates
+onto wgpu, are sample counts, and the game measures with them: the sun's
+visibility is the samples that passed over the area of its disc, so any
+glimpse of the sun (a gap in the leaves, a building's edge) counted as
+all of it, and the lens flare and the sun's bloom went to full strength.
+
+Metal now counts where the GPU can (every Mac family, Apple3 and later).
+Vulkan enables occlusionQueryPrecise when the device has it and begins
+occlusion queries with PRECISE. Other devices keep the old behaviour.
+
+---
+ src/metal/adapter.rs  |  4 ++++
+ src/metal/command.rs  | 10 +++++++++-
+ src/metal/mod.rs      |  4 ++++
+ src/vulkan/adapter.rs |  3 ++-
+ src/vulkan/command.rs |  9 +++------
+ src/vulkan/device.rs  | 12 +++++++++++-
+ src/vulkan/mod.rs     | 10 ++++++++++
+ 7 files changed, 43 insertions(+), 9 deletions(-)
+
+diff --git a/src/metal/adapter.rs b/src/metal/adapter.rs
+index c9c48c3..56f1c29 100644
+--- a/src/metal/adapter.rs
++++ b/src/metal/adapter.rs
+@@ -1070,6 +1070,9 @@ impl super::CapabilitiesQuery {
+                 None
+             },
+             timestamp_query_support,
++            // Counting occlusion queries: every Mac family, Apple3 (A9) and later.
++            counting_occlusion_query: os_type == super::OsType::Macos
++                || (family_check && device.supportsFamily(MTLGPUFamily::Apple3)),
+             // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf#page=4
+             supports_simd_scoped_operations: family_check
+                 && (metal3
+@@ -1561,6 +1564,7 @@ impl super::CapabilitiesQuery {
+             headless: self.headless,
+             has_unified_memory: self.has_unified_memory,
+             timestamp_query_support: self.timestamp_query_support,
++            counting_occlusion_query: self.counting_occlusion_query,
+             supports_memoryless_storage: self.supports_memoryless_storage,
+             mesh_shaders: self.mesh_shaders,
+         }
+diff --git a/src/metal/command.rs b/src/metal/command.rs
+index ba41a63..40106d6 100644
+--- a/src/metal/command.rs
++++ b/src/metal/command.rs
+@@ -766,12 +766,20 @@ impl crate::CommandEncoder for super::CommandEncoder {
+     unsafe fn begin_query(&mut self, set: &super::QuerySet, index: u32) {
+         match set.ty {
+             wgt::QueryType::Occlusion => {
++                // Counting where the GPU can: WebGPU only promises a non-zero
++                // result when samples passed, and APIs translated onto wgpu
++                // (D3D11 occlusion queries) need the number of samples.
++                let mode = if self.shared.private_caps.counting_occlusion_query {
++                    MTLVisibilityResultMode::Counting
++                } else {
++                    MTLVisibilityResultMode::Boolean
++                };
+                 self.state
+                     .render
+                     .as_ref()
+                     .unwrap()
+                     .setVisibilityResultMode_offset(
+-                        MTLVisibilityResultMode::Boolean,
++                        mode,
+                         index as usize * crate::QUERY_SIZE as usize,
+                     );
+             }
+diff --git a/src/metal/mod.rs b/src/metal/mod.rs
+index e227590..e7543e6 100644
+--- a/src/metal/mod.rs
++++ b/src/metal/mod.rs
+@@ -316,6 +316,7 @@ struct CapabilitiesQuery {
+     supports_shader_primitive_index: bool,
+     has_unified_memory: Option<bool>,
+     timestamp_query_support: TimestampQuerySupport,
++    counting_occlusion_query: bool,
+     supports_simd_scoped_operations: bool,
+     supports_cooperative_matrix: bool,
+     int64: bool,
+@@ -341,6 +342,9 @@ struct PrivateCapabilities {
+     headless: bool,
+     has_unified_memory: Option<bool>,
+     timestamp_query_support: TimestampQuerySupport,
++    /// Occlusion queries count the samples that pass instead of only
++    /// recording whether any did.
++    counting_occlusion_query: bool,
+     supports_memoryless_storage: bool,
+     mesh_shaders: bool,
+ }
+diff --git a/src/vulkan/adapter.rs b/src/vulkan/adapter.rs
+index 196daf4..36c021a 100644
+--- a/src/vulkan/adapter.rs
++++ b/src/vulkan/adapter.rs
+@@ -328,7 +328,7 @@ impl PhysicalDeviceFeatures {
+                     requested_features.contains(wgt::Features::TEXTURE_COMPRESSION_BC),
+                     // BC provides formats for Sliced 3D
+                 )
+-                //.occlusion_query_precise(requested_features.contains(wgt::Features::PRECISE_OCCLUSION_QUERY))
++                .occlusion_query_precise(private_caps.precise_occlusion_query)
+                 .pipeline_statistics_query(
+                     requested_features.contains(wgt::Features::PIPELINE_STATISTICS_QUERY),
+                 )
+@@ -2422,6 +2422,7 @@ impl super::Instance {
+             ),
+             multi_draw_indirect: phd_features.core.multi_draw_indirect != 0,
+             max_draw_indirect_count: phd_capabilities.properties.limits.max_draw_indirect_count,
++            precise_occlusion_query: phd_features.core.occlusion_query_precise != 0,
+             non_coherent_map_mask: phd_capabilities.properties.limits.non_coherent_atom_size - 1,
+             can_present: true,
+             //TODO: make configurable
+diff --git a/src/vulkan/command.rs b/src/vulkan/command.rs
+index 3ea853e..cca6272 100644
+--- a/src/vulkan/command.rs
++++ b/src/vulkan/command.rs
+@@ -430,12 +430,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
+ 
+     unsafe fn begin_query(&mut self, set: &super::QuerySet, index: u32) {
+         unsafe {
+-            self.device.raw.cmd_begin_query(
+-                self.active,
+-                set.raw,
+-                index,
+-                vk::QueryControlFlags::empty(),
+-            )
++            self.device
++                .raw
++                .cmd_begin_query(self.active, set.raw, index, set.control)
+         };
+     }
+     unsafe fn end_query(&mut self, set: &super::QuerySet, index: u32) {
+diff --git a/src/vulkan/device.rs b/src/vulkan/device.rs
+index 948f77a..a82e25f 100644
+--- a/src/vulkan/device.rs
++++ b/src/vulkan/device.rs
+@@ -2516,7 +2516,17 @@ impl crate::Device for super::Device {
+ 
+         self.counters.query_sets.add(1);
+ 
+-        Ok(super::QuerySet { raw })
++        // Counting where the device can: WebGPU only promises a non-zero
++        // result when samples passed, and APIs translated onto wgpu (D3D11
++        // occlusion queries) need the number of samples.
++        let control = match desc.ty {
++            wgt::QueryType::Occlusion if self.shared.private_caps.precise_occlusion_query => {
++                vk::QueryControlFlags::PRECISE
++            }
++            _ => vk::QueryControlFlags::empty(),
++        };
++
++        Ok(super::QuerySet { raw, control })
+     }
+ 
+     unsafe fn destroy_query_set(&self, set: super::QuerySet) {
+diff --git a/src/vulkan/mod.rs b/src/vulkan/mod.rs
+index 51e7414..60f20ec 100644
+--- a/src/vulkan/mod.rs
++++ b/src/vulkan/mod.rs
+@@ -350,6 +350,13 @@ struct PrivateCapabilities {
+     multi_draw_indirect: bool,
+     max_draw_indirect_count: u32,
+ 
++    /// True if this adapter supports the [`occlusionQueryPrecise`][oqp]
++    /// feature: occlusion queries then count the samples that pass instead
++    /// of returning any non-zero value.
++    ///
++    /// [oqp]: https://registry.khronos.org/vulkan/specs/latest/man/html/VkPhysicalDeviceFeatures.html#features-occlusionQueryPrecise
++    precise_occlusion_query: bool,
++
+     /// True if this adapter advertises the [`robustBufferAccess`][vrba] feature.
+     ///
+     /// Note that Vulkan's `robustBufferAccess` is not sufficient to implement
+@@ -1186,6 +1193,9 @@ impl crate::DynPipelineCache for PipelineCache {}
+ #[derive(Debug)]
+ pub struct QuerySet {
+     raw: vk::QueryPool,
++    /// What queries in this set begin with: [`vk::QueryControlFlags::PRECISE`]
++    /// for occlusion queries where the device counts samples.
++    control: vk::QueryControlFlags,
+ }
+ 
+ impl crate::DynQuerySet for QuerySet {}
+-- 
+2.50.1 (Apple Git-155)
+

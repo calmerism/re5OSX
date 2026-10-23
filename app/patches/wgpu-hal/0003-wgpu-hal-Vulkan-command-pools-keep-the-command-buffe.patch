@@ -1,0 +1,111 @@
+From 9638a2987d22d84e74aaf5007be82291075e0ecc Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:31:11 +0200
+Subject: [PATCH] wgpu-hal: Vulkan command pools are replaced when they hold
+ twice what their last use needed
+
+A command encoder's pool allocated command buffers 16 at a time and kept
+every one it ever had for reuse. wgpu-core hands its pooled encoders to
+whichever command encoder comes next, and records each pass into command
+buffers of its own, so over time every pool grew to the biggest use of
+any. On Mali a command buffer's builder takes ~0.4 MB of host memory as
+soon as it is allocated: in a game with ~70 passes a frame, 25 pools held
+1,300 command buffers, 556 MiB, plus 190 MiB of their command memory, and
+the process ran out of memory.
+
+Now they are allocated one at a time, and a reset that finds the pool
+holding at least twice the command buffers its last use needed (and 4 or
+more unused) replaces the pool with an empty one. The whole pool goes, no
+command buffer of it is kept: freeing only the unused command buffers
+with vkFreeCommandBuffers at every reset, as this patch first did, made a
+Mali-G925 (Dimensity 9400, Android 16) fault on GPU address 0x80 within
+minutes under heavy streaming, and the kernel terminated the context; it
+did not happen with nothing freed.
+---
+diff --git a/src/vulkan/command.rs b/src/vulkan/command.rs
+index 0ccb1cd..557b786 100644
+--- a/src/vulkan/command.rs
++++ b/src/vulkan/command.rs
+@@ -4,7 +4,6 @@ use ash::vk;
+ use core::{mem, ops::Range};
+ use hashbrown::hash_map::Entry;
+ 
+-const ALLOCATION_GRANULARITY: u32 = 16;
+ const DST_IMAGE_LAYOUT: vk::ImageLayout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+ 
+ impl super::Texture {
+@@ -120,10 +119,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
+     type A = super::Api;
+ 
+     unsafe fn begin_encoding(&mut self, label: crate::Label) -> Result<(), crate::DeviceError> {
++        // One at a time: a command buffer can be expensive (on Mali its
++        // builder takes ~0.4 MB of host memory as soon as it is allocated).
+         if self.free.is_empty() {
+             let vk_info = vk::CommandBufferAllocateInfo::default()
+                 .command_pool(self.raw)
+-                .command_buffer_count(ALLOCATION_GRANULARITY);
++                .command_buffer_count(1);
+             let cmd_buf_vec = unsafe {
+                 self.device
+                     .raw
+@@ -178,6 +179,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         I: Iterator<Item = super::CommandBuffer>,
+     {
+         self.temp.clear();
++        // The command buffers not used since the last reset.
++        let unused = self.free.len();
+         self.free
+             .extend(cmd_bufs.into_iter().map(|cmd_buf| cmd_buf.raw));
+         self.free.append(&mut self.discarded);
+@@ -185,6 +188,26 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         for (_, framebuffer) in self.framebuffers.drain() {
+             unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
+         }
++        // A pool holding at least twice the command buffers its last use
++        // needed is replaced by an empty one. wgpu-core hands its pooled
++        // encoders to any user, so otherwise every pool grows to the biggest
++        // use of any (on Mali, ~0.4 MB of host memory per command buffer:
++        // hundreds of MB). The whole pool goes: freeing only the unused
++        // command buffers (vkFreeCommandBuffers) and keeping the others made
++        // a Mali-G925 (MediaTek) fault on a wild GPU address within minutes.
++        let used = self.free.len() - unused;
++        if unused >= 4 && unused >= used {
++            let vk_info = vk::CommandPoolCreateInfo::default()
++                .queue_family_index(self.family_index)
++                .flags(vk::CommandPoolCreateFlags::TRANSIENT);
++            if let Ok(raw) = unsafe { self.device.raw.create_command_pool(&vk_info, None) } {
++                // None of its command buffers is pending, as in `Drop`.
++                unsafe { self.device.raw.destroy_command_pool(self.raw, None) };
++                self.raw = raw;
++                self.free.clear();
++                return;
++            }
++        }
+         let _ = unsafe {
+             self.device
+                 .raw
+diff --git a/src/vulkan/device.rs b/src/vulkan/device.rs
+index 9ff2c95..3a10fb7 100644
+--- a/src/vulkan/device.rs
++++ b/src/vulkan/device.rs
+@@ -1388,6 +1388,7 @@ impl crate::Device for super::Device {
+ 
+         Ok(super::CommandEncoder {
+             raw,
++            family_index: desc.queue.family_index,
+             device: Arc::clone(&self.shared),
+             active: vk::CommandBuffer::null(),
+             bind_point: vk::PipelineBindPoint::default(),
+diff --git a/src/vulkan/mod.rs b/src/vulkan/mod.rs
+index fa0b888..37eb9a5 100644
+--- a/src/vulkan/mod.rs
++++ b/src/vulkan/mod.rs
+@@ -1053,6 +1053,8 @@ struct TempTextureViewKey {
+ // be reset for reused encoders in `begin_encoding`.
+ pub struct CommandEncoder {
+     raw: vk::CommandPool,
++    /// The queue family of the command pool, to replace it.
++    family_index: u32,
+     device: Arc<DeviceShared>,
+ 
+     /// The current command buffer, if `self` is in the ["recording"]

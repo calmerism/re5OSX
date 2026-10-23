@@ -1,0 +1,59 @@
+# The map tour of `mise run shaders:collect` (headless --tour): places with
+# different things to draw (interiors, city, countryside, mountains, water),
+# at hours and in weathers that change the lighting and the effects.
+#
+# x y z hour weather  # name
+# The player is set on the ground near x y z (the engine's teleport).
+
+# Interiors
+-802.3   175.0   72.8  12 EXTRASUNNY  # Michael's house, living room
+   7.1   538.3  176.0  21 CLEAR       # Franklin's house, re5OSX Hills
+ -14.4 -1438.5   31.1  15 CLOUDS      # Franklin's aunt's house, Strawberry
+1973.0  3816.0   33.4  10 EXTRASUNNY  # Trevor's trailer, Sandy Shores
+-1150.7 -1520.7  10.6  18 OVERCAST    # Floyd's apartment, Vespucci
+1273.9 -1719.7   54.8  23 RAIN        # Lester's house, El Burro Heights
+ 108.0 -1305.0   29.0   1 CLEAR       # Vanilla Unicorn
+  22.0 -1107.0   29.8  13 SMOG        # Ammu-Nation, Pillbox Hill
+-347.0  -133.0   39.0  16 CLEAR       # Los Santos Customs, Burton
+  25.7 -1347.3   29.5   3 FOGGY       # 24/7, Strawberry
+-718.5  -158.9   37.0  11 EXTRASUNNY  # Ponsonbys, Burton
+-814.3  -183.8   37.6  19 CLOUDS      # Herr Kutz barber
+-1155.6 -1426.9   4.9  20 CLEARING    # Tattoo parlour, Vespucci
+  75.4 -1392.9   29.4   8 SMOG        # Binco, Strawberry
+ -56.5 -1096.6   26.4  14 CLEAR       # Premium Deluxe Motorsport
+-565.0   276.0   83.1  22 THUNDER     # Tequi-la-la
+
+# City
+ 195.0  -934.0   30.7  12 EXTRASUNNY  # Legion Square
+ 300.0   180.0  104.0  23 CLEAR       # re5OSX Boulevard, neon
+ -75.0  -818.0  326.2  20 CLEAR       # Maze Bank Tower, roof
+ 100.0 -1940.0   20.8  17 SMOG        # Grove Street
+1000.0 -3000.0    5.9   6 FOGGY       # Port of Los Santos
+-1850.0 -1231.0  13.0  22 CLEAR       # Del Perro Pier
+-1393.0 -1500.0   4.4  13 EXTRASUNNY  # Vespucci Beach
+ 982.0  -103.0   74.8   2 RAIN        # Lost MC clubhouse, Mirror Park
+-150.0  -150.0   43.6   9 OVERCAST    # Rockford Plaza
+-1037.0 -2737.0  20.2  16 CLOUDS      # Los Santos International Airport
+ 640.0 -1300.0   10.0   7 CLEARING    # Los Santos river
+-2240.0  260.0  174.6  18 EXTRASUNNY  # Kortz Center
+-1360.0    60.0  54.0  11 CLEAR       # Los Santos Golf Club
+-425.0  1123.0  325.9  21 CLEAR       # Galileo Observatory
+ 711.0  1198.0  348.5   5 FOGGY       # re5OSX sign
+
+# Countryside
+1660.0     0.0  170.0  15 OVERCAST    # Land Act Dam
+2700.0  1600.0   24.5   0 THUNDER     # Palmer-Taylor Power Station
+2350.0  1850.0  100.0  12 EXTRASUNNY  # Ron Alternates wind farm
+1747.0  3273.0   41.1  19 CLEAR       # Sandy Shores airfield
+1300.0  4100.0   31.0  11 EXTRASUNNY  # Alamo Sea, in the water
+1700.0  4800.0   42.0   6 CLOUDS      # Grapeseed
+2440.0  4975.0   46.8  22 RAIN        # O'Neil farm
+3615.0  3735.0   28.7  14 SMOG        # Humane Labs
+ 501.0  5604.0  797.9  10 CLEAR       # Mount Chiliad summit
+-150.0  6400.0   31.5  17 OVERCAST    # Paleto Bay
+ -70.0  6255.0   31.1   2 FOGGY       # Paleto Bay, Cluckin' Bell factory
+-3150.0  1100.0  20.7  13 EXTRASUNNY  # Chumash
+-2047.0  3132.0  32.8  12 CLEAR       # Fort Zancudo
+-1700.0 -1300.0  -8.0  13 EXTRASUNNY  # The sea off Vespucci, under water
+ 195.0  -934.0   30.7  12 XMAS        # Legion Square in the snow
+1747.0  3273.0   41.1   3 BLIZZARD    # Sandy Shores in a blizzard

@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:00:00 +0200
+Subject: [PATCH] wgpu-core: passes go on in the command buffer before them
+
+After 0007 each pass still begins a command buffer of its own; on Metal
+each is handed to the kernel and released after completion (about 80 a
+frame for a game: ~2 ms of CPU a frame across the app's and Metal's
+threads). Where barriers record nothing (CommandEncoder::
+transitions_are_noops), a pass that needs nothing but barriers before it
+(no discarded surfaces to clear, no query resets, no indirect draws'
+validation) goes on in the suspended command buffer before it; the
+barriers' tracker updates are still made. Commands run in the order
+recorded, as before.
+---
+diff --git a/src/command/compute.rs b/src/command/compute.rs
+index b9fb12a..60879ce 100644
+--- a/src/command/compute.rs
++++ b/src/command/compute.rs
+@@ -670,10 +670,16 @@ pub(super) fn encode_compute_pass(
+         .raw_encoder
+         .close_if_open()
+         .map_pass_err(pass_scope)?;
+-    let raw_encoder = parent_state
+-        .raw_encoder
+-        .open_pass(base.label.as_deref())
+-        .map_pass_err(pass_scope)?;
++    // re5osx: only clears of discarded surfaces may have to run before the
++    // pass besides barriers (query resets are recorded in the pass's own).
++    let raw_encoder = if parent_state.texture_memory_actions.has_discards() {
++        parent_state.raw_encoder.open_pass(base.label.as_deref())
++    } else {
++        parent_state
++            .raw_encoder
++            .open_pass_after(base.label.as_deref())
++    }
++    .map_pass_err(pass_scope)?;
+ 
+     let mut debug_scope_depth = 0;
+ 
+diff --git a/src/command/memory_init.rs b/src/command/memory_init.rs
+index 85e5e64..741d0a6 100644
+--- a/src/command/memory_init.rs
++++ b/src/command/memory_init.rs
+@@ -44,6 +44,12 @@ impl CommandBufferTextureMemoryActions {
+         self.init_actions.drain(..)
+     }
+ 
++    /// Whether surfaces were discarded (and must be cleared before they
++    /// are read again).
++    pub(crate) fn has_discards(&self) -> bool {
++        !self.discards.is_empty()
++    }
++
+     pub(crate) fn discard(&mut self, discard: TextureSurfaceDiscard) {
+         self.discards.push(discard);
+     }
+diff --git a/src/command/mod.rs b/src/command/mod.rs
+index efbf13d..fb1e333 100644
+--- a/src/command/mod.rs
++++ b/src/command/mod.rs
+@@ -636,6 +636,10 @@ pub(crate) struct InnerCommandEncoder {
+     /// true if the command buffer before the pass's was suspended.
+     pub(crate) suspended_before_pass: bool,
+ 
++    /// True if the pass being recorded went on in the command buffer before
++    /// it ([`Self::open_pass_after`]).
++    pub(crate) pass_resumed: bool,
++
+     /// Tracks which API is being used to encode commands.
+     ///
+     /// Mixing the wgpu encoding API with access to the raw hal encoder via
+@@ -850,7 +854,12 @@ impl InnerCommandEncoder {
+         label: Option<&str>,
+     ) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+         assert!(!self.is_open);
+-        if self.suspended_before_pass {
++        if self.pass_resumed {
++            let cmd_buf = self.list.pop().unwrap();
++            unsafe { self.raw.resume_encoding(cmd_buf) };
++            self.is_open = true;
++            Ok(self.raw.as_mut())
++        } else if self.suspended_before_pass {
+             let cmd_buf = self.list.remove(self.list.len() - 2);
+             unsafe { self.raw.resume_encoding(cmd_buf) };
+             self.is_open = true;
+@@ -865,9 +874,40 @@ impl InnerCommandEncoder {
+     /// the pass follows it.
+     pub(crate) fn close_before_pass(&mut self) -> Result<(), DeviceError> {
+         self.suspended_before_pass = false;
++        if self.pass_resumed {
++            // The pass's own command buffer, after the pass: what comes
++            // next can go on in it.
++            self.pass_resumed = false;
++            return self.close_if_open();
++        }
+         self.close_and_swap()
+     }
+ 
++    /// Begin recording a render or compute pass that needs nothing to run
++    /// before it but barriers: where barriers record nothing
++    /// ([`hal::CommandEncoder::transitions_are_noops`]), in the command
++    /// buffer before it if that one was suspended, else in a new one
++    /// ([`Self::open_pass`]). [`Self::open_before_pass`] then records the
++    /// barriers after the pass, in the same command buffer.
++    ///
++    /// (re5osx: Metal hands each command buffer to the kernel and releases
++    /// it after completion, and passes took one each, about 80 a frame.)
++    pub(crate) fn open_pass_after(
++        &mut self,
++        label: Option<&str>,
++    ) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
++        assert!(!self.is_open);
++        if !(self.last_suspended && self.raw.transitions_are_noops()) {
++            return self.open_pass(label);
++        }
++        let cmd_buf = self.list.pop().unwrap();
++        unsafe { self.raw.resume_encoding(cmd_buf) };
++        self.last_suspended = false;
++        self.pass_resumed = true;
++        self.is_open = true;
++        Ok(self.raw.as_mut())
++    }
++
+     /// If the command encoder is not open, begin recording a new command buffer.
+     ///
+     /// If the command encoder was already open, does nothing.
+@@ -906,6 +946,7 @@ impl InnerCommandEncoder {
+     ) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+         assert!(!self.is_open);
+ 
++        self.pass_resumed = false;
+         let hal_label = hal_label(label, self.device.instance_flags);
+         unsafe { self.raw.begin_encoding(hal_label) }
+             .map_err(|e| self.device.handle_hal_error(e))?;
+@@ -1033,6 +1074,7 @@ impl CommandEncoder {
+                         device: device.clone(),
+                         is_open: false,
+                         last_suspended: false,
++                        pass_resumed: false,
+                         suspended_before_pass: false,
+                         api: EncodingApi::Undecided,
+                         label: label.to_string(),
+diff --git a/src/command/render.rs b/src/command/render.rs
+index 0a8382c..82d9cd1 100644
+--- a/src/command/render.rs
++++ b/src/command/render.rs
+@@ -2311,10 +2311,27 @@ pub(super) fn encode_render_pass(
+         .raw_encoder
+         .close_if_open()
+         .map_pass_err(pass_scope)?;
+-    let raw_encoder = parent_state
+-        .raw_encoder
+-        .open_pass(base.label.as_deref())
+-        .map_pass_err(pass_scope)?;
++    // re5osx: what may have to run before the pass besides barriers: clears
++    // of discarded surfaces, query resets, indirect draws' validation.
++    let only_barriers_before = parent_state.raw_encoder.raw.transitions_are_noops() && timestamp_writes.is_none()
++        && !parent_state.texture_memory_actions.has_discards()
++        && !base.commands.iter().any(|command| match command {
++            ArcRenderCommand::BeginOcclusionQuery { .. }
++            | ArcRenderCommand::WriteTimestamp { .. }
++            | ArcRenderCommand::BeginPipelineStatisticsQuery { .. }
++            | ArcRenderCommand::ExecuteBundle(_)
++            | ArcRenderCommand::MultiDrawIndirectCount { .. } => true,
++            ArcRenderCommand::DrawIndirect { .. } => device.indirect_validation.is_some(),
++            _ => false,
++        });
++    let raw_encoder = if only_barriers_before {
++        parent_state
++            .raw_encoder
++            .open_pass_after(base.label.as_deref())
++    } else {
++        parent_state.raw_encoder.open_pass(base.label.as_deref())
++    }
++    .map_pass_err(pass_scope)?;
+ 
+     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
+         let mut pending_query_resets = QueryResetMap::new();
+diff --git a/src/device/queue.rs b/src/device/queue.rs
+index d3c7577..85cb2bd 100644
+--- a/src/device/queue.rs
++++ b/src/device/queue.rs
+@@ -485,6 +485,7 @@ impl PendingWrites {
+                     device: device.clone(),
+                     is_open: false,
+                     last_suspended: false,
++                    pass_resumed: false,
+                     suspended_before_pass: false,
+                     api: crate::command::EncodingApi::InternalUse,
+                     label: "(wgpu internal) PendingWrites command encoder".into(),
+-- 
+2.50.1
+

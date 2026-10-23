@@ -1,0 +1,204 @@
+From 3625948c25d91267a6128aed8f4724254fd3b5ee Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 17:05:52 +0200
+Subject: [PATCH] wgpu-core: RenderPass::set_depth_bias
+
+The render pass command SetDepthBias sets the depth bias of the
+triangles drawn with a depth-stencil attachment from then on in the
+pass, in place of their pipelines' own (wgpu-hal's set_depth_bias,
+dynamic state on Vulkan, the encoder's on Metal): pipelines that differ
+only in their depth bias can be one. Like the stencil reference, it is
+pass state: set again after each pipeline that uses it
+(PipelineFlags::DEPTH_BIAS). A clamp needs DownlevelFlags::DEPTH_BIAS_CLAMP,
+as in a pipeline. Not available in render bundles.
+
+---
+ src/command/bundle.rs         |  2 ++
+ src/command/mod.rs            |  2 ++
+ src/command/render.rs         | 46 +++++++++++++++++++++++++++++++++++
+ src/command/render_command.rs |  1 +
+ src/device/resource.rs        |  3 +++
+ src/device/trace/record.rs    |  1 +
+ src/pipeline.rs               |  3 +++
+ 7 files changed, 58 insertions(+)
+
+diff --git a/src/command/bundle.rs b/src/command/bundle.rs
+index e34b3fc..ad435f6 100644
+--- a/src/command/bundle.rs
++++ b/src/command/bundle.rs
+@@ -534,6 +534,7 @@ impl RenderBundleEncoder {
+                 &RenderCommand::ExecuteBundle(_)
+                 | &RenderCommand::SetBlendConstant(_)
+                 | &RenderCommand::SetStencilReference(_)
++                | &RenderCommand::SetDepthBias(_)
+                 | &RenderCommand::SetViewport { .. }
+                 | &RenderCommand::SetScissor(_) => unreachable!("not supported by a render bundle"),
+             }
+@@ -1507,6 +1508,7 @@ impl RenderBundle {
+                 Cmd::ExecuteBundle(_)
+                 | Cmd::SetBlendConstant(_)
+                 | Cmd::SetStencilReference(_)
++                | Cmd::SetDepthBias(_)
+                 | Cmd::SetViewport { .. }
+                 | Cmd::SetScissor(_) => unreachable!(),
+             }
+diff --git a/src/command/mod.rs b/src/command/mod.rs
+index e61429e..c21880d 100644
+--- a/src/command/mod.rs
++++ b/src/command/mod.rs
+@@ -2081,6 +2081,8 @@ pub enum PassErrorScope {
+     SetBlendConstant,
+     #[error("In a set_stencil_reference command")]
+     SetStencilReference,
++    #[error("In a set_depth_bias command")]
++    SetDepthBias,
+     #[error("In a set_viewport command")]
+     SetViewport,
+     #[error("In a set_scissor_rect command")]
+diff --git a/src/command/render.rs b/src/command/render.rs
+index 75a150c..b46f9a7 100644
+--- a/src/command/render.rs
++++ b/src/command/render.rs
+@@ -674,6 +674,8 @@ struct State<'scope, 'snatch_guard, 'cmd_enc> {
+     pipeline_flags: PipelineFlags,
+     blend_constant: OptionalState,
+     stencil_reference: u32,
++    /// Set by `set_depth_bias`: replaces the pipelines' own.
++    depth_bias: Option<wgt::DepthBiasState>,
+     pipeline: Option<Arc<RenderPipeline>>,
+     index: IndexState,
+     vertex: VertexState,
+@@ -2354,6 +2356,7 @@ pub(super) fn encode_render_pass(
+             pipeline_flags: PipelineFlags::empty(),
+             blend_constant: OptionalState::Unused,
+             stencil_reference: 0,
++            depth_bias: None,
+             pipeline: None,
+             index: IndexState::default(),
+             vertex: VertexState::default(),
+@@ -2441,6 +2444,10 @@ pub(super) fn encode_render_pass(
+                 ArcRenderCommand::SetStencilReference(value) => {
+                     set_stencil_reference(&mut state, value);
+                 }
++                ArcRenderCommand::SetDepthBias(bias) => {
++                    let scope = PassErrorScope::SetDepthBias;
++                    set_depth_bias(&mut state, device, bias).map_pass_err(scope)?;
++                }
+                 ArcRenderCommand::SetViewport {
+                     rect,
+                     depth_min,
+@@ -2823,6 +2830,13 @@ fn set_pipeline(
+         }
+     }
+ 
++    // Binding the pipeline set its own depth bias.
++    if let Some(bias) = state.depth_bias {
++        if pipeline.flags.contains(PipelineFlags::DEPTH_BIAS) {
++            unsafe { state.pass.base.raw_encoder.set_depth_bias(&bias) };
++        }
++    }
++
+     // Rebind resource
+     pass::change_pipeline_layout::<RenderPassErrorInner, _>(
+         &mut state.pass,
+@@ -3005,6 +3019,23 @@ fn set_stencil_reference(state: &mut State, value: u32) {
+     }
+ }
+ 
++fn set_depth_bias(
++    state: &mut State,
++    device: &Arc<Device>,
++    bias: wgt::DepthBiasState,
++) -> Result<(), RenderPassErrorInner> {
++    api_log!("RenderPass::set_depth_bias {bias:?}");
++
++    if bias.clamp != 0.0 {
++        device.require_downlevel_flags(wgt::DownlevelFlags::DEPTH_BIAS_CLAMP)?;
++    }
++    state.depth_bias = Some(bias);
++    if state.pipeline_flags.contains(PipelineFlags::DEPTH_BIAS) {
++        unsafe { state.pass.base.raw_encoder.set_depth_bias(&bias) };
++    }
++    Ok(())
++}
++
+ fn set_viewport(
+     state: &mut State,
+     rect: Rect<f32>,
+@@ -3860,6 +3891,21 @@ impl Global {
+         Ok(())
+     }
+ 
++    /// Sets the depth bias of the triangles drawn with a depth-stencil
++    /// attachment from now on in the pass, in place of their pipelines' own
++    /// (as `vkCmdSetDepthBias`, or Metal's encoder state): pipelines that
++    /// differ only in their depth bias can be one.
++    pub fn render_pass_set_depth_bias(
++        &self,
++        pass: &mut RenderPass,
++        bias: wgt::DepthBiasState,
++    ) -> Result<(), PassStateError> {
++        let scope = PassErrorScope::SetDepthBias;
++        let base = pass_base!(pass, scope);
++        base.commands.push(ArcRenderCommand::SetDepthBias(bias));
++        Ok(())
++    }
++
+     pub fn render_pass_set_stencil_reference_with_id(
+         &self,
+         pass: id::RenderPassEncoderId,
+diff --git a/src/command/render_command.rs b/src/command/render_command.rs
+index 962b3bd..29a577d 100644
+--- a/src/command/render_command.rs
++++ b/src/command/render_command.rs
+@@ -33,6 +33,7 @@ pub enum RenderCommand<R: ReferenceType> {
+     },
+     SetBlendConstant(Color),
+     SetStencilReference(u32),
++    SetDepthBias(wgt::DepthBiasState),
+     SetViewport {
+         rect: Rect<f32>,
+         //TODO: use half-float to reduce the size?
+diff --git a/src/device/resource.rs b/src/device/resource.rs
+index 4553e57..872f460 100644
+--- a/src/device/resource.rs
++++ b/src/device/resource.rs
+@@ -5060,6 +5060,9 @@ impl Device {
+             if !ds.is_stencil_read_only(desc.primitive.cull_mode) {
+                 flags |= pipeline::PipelineFlags::WRITES_STENCIL;
+             }
++            if desc.primitive.topology.is_triangles() {
++                flags |= pipeline::PipelineFlags::DEPTH_BIAS;
++            }
+         }
+ 
+         let pipeline = pipeline::RenderPipeline {
+diff --git a/src/device/trace/record.rs b/src/device/trace/record.rs
+index 553e41a..2343a50 100644
+--- a/src/device/trace/record.rs
++++ b/src/device/trace/record.rs
+@@ -564,6 +564,7 @@ impl IntoTrace for ArcRenderCommand {
+             },
+             C::SetBlendConstant(color) => C::SetBlendConstant(color),
+             C::SetStencilReference(val) => C::SetStencilReference(val),
++            C::SetDepthBias(bias) => C::SetDepthBias(bias),
+             C::SetViewport {
+                 rect,
+                 depth_min,
+diff --git a/src/pipeline.rs b/src/pipeline.rs
+index d915605..5db23db 100644
+--- a/src/pipeline.rs
++++ b/src/pipeline.rs
+@@ -882,6 +882,9 @@ bitflags::bitflags! {
+         const STENCIL_REFERENCE = 1 << 1;
+         const WRITES_DEPTH = 1 << 2;
+         const WRITES_STENCIL = 1 << 3;
++        /// Draws triangles with a depth-stencil attachment: the render
++        /// pass's depth bias (`set_depth_bias`), once set, replaces its own.
++        const DEPTH_BIAS = 1 << 4;
+     }
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

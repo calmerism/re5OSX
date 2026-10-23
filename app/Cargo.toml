@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# third_party/wgpu, wgpu-core, wgpu-hal and sp-fidelity are prepared by
+# `mise run setup`; this workspace needs them before it can load.
+# re5osx-studio is its own workspace (wasm only, built by re5osx-mods).
+exclude = ["third_party", "crates/re5osx-studio"]
+default-members = ["crates/re5osx"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+re5osx-game = { path = "crates/re5osx-game" }
+re5osx-runtime = { path = "crates/re5osx-runtime" }
+re5osx-gpu = { path = "crates/re5osx-gpu" }
+re5osx = { path = "crates/re5osx" }
+re5osx-stream = { path = "crates/re5osx-stream" }
+re5osx-mods = { path = "crates/re5osx-mods" }
+re5osx-qos = { path = "crates/re5osx-qos" }
+
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+egui = "0.36"
+egui-wgpu = { version = "0.36", default-features = false }
+serde_json = "1"
+wgpu = { version = "30", default-features = false }
+
+# build-time
+cc = { version = "1", features = ["parallel"] }
+sha2 = "0.11"
+wasmparser = "0.261"
+
+[profile.release]
+debug = "line-tables-only"
+
+# The game's generated C is always compiled with optimisations (see
+# re5osx-game/build.rs); this only affects the Rust side.
+[profile.dev.package."*"]
+opt-level = 1
+
+# wgpu, wgpu-core, wgpu-hal and sp-fidelity with our patches
+# (patches/<name>) on top of the releases, prepared by `mise run setup`.
+[patch.crates-io]
+wgpu = { path = "third_party/wgpu" }
+wgpu-core = { path = "third_party/wgpu-core" }
+wgpu-hal = { path = "third_party/wgpu-hal" }
+sp-fidelity = { path = "third_party/sp-fidelity" }

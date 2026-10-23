@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 15:20:00 +0200
+Subject: [PATCH 3/3] wgpu-core: wait for the GPU before taking the snatch lock
+ in poll
+
+Device::poll took the device's snatch lock for reading, then waited for
+the GPU while holding it. A thread waiting for a submission to complete
+(a completion thread, frames-in-flight pacing) therefore held the lock for
+up to a frame, and every writer (Buffer::destroy, Texture::destroy) waited
+that long; the lock is fair, so every other reader queued behind the
+writer too: command encoding, resource creation, submits. On a phone
+streaming the world this was 7-12 ms of stall a frame on the submit
+thread, and recording slowed with it. The wait now happens before the
+lock is taken; `maintain` waits again (immediately done) and reports
+errors as before.
+
+---
+ src/device/resource.rs | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+--- a/src/device/resource.rs
++++ b/src/device/resource.rs
+@@ -794,6 +794,25 @@
+         &self,
+         poll_type: wgt::PollType<crate::SubmissionIndex>,
+     ) -> (UserClosures, Result<wgt::PollStatus, WaitIdleError>) {
++        // re5osx: the GPU is waited for before the snatch lock is taken. Held
++        // for reading through the wait, the lock kept every writer (a buffer
++        // or texture destroyed) waiting until the GPU was done, and with them
++        // every other reader queued behind the writer: recording, resource
++        // creation, submits, on all threads. `maintain` waits again (no time
++        // once done) and reports what goes wrong.
++        if let wgt::PollType::Wait {
++            submission_index,
++            timeout,
++        } = poll_type
++        {
++            let last = self
++                .last_successful_submission_index
++                .load(Ordering::Acquire);
++            let target = submission_index.unwrap_or(last);
++            if target <= last {
++                let _ = unsafe { self.raw().wait(self.fence.as_ref(), target, timeout) };
++            }
++        }
+         let snatch_guard = self.snatchable_lock.read();
+         let maintain_result = self.maintain(poll_type, snatch_guard);
+ 
+-- 
+2.50.1
+

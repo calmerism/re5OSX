@@ -1,0 +1,80 @@
+From df3c6055e374d570fe715d3e9b90a195ce0e994b Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Sat, 10 Oct 2026 14:30:42 +0200
+Subject: [PATCH 1/3] wasm2c: implement memory.atomic.wait32/wait64/notify via
+ host functions
+
+The generated code calls wasm_rt_atomic_wait32/wasm_rt_atomic_wait64/
+wasm_rt_atomic_notify, which the embedder provides (they usually share a
+parking table with host threads that wait on the same addresses).
+---
+ src/c-writer.cc                              | 28 ++++++++++++++++++--
+ src/template/wasm2c_atomicops.declarations.c | 13 +++++++++
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/src/c-writer.cc b/src/c-writer.cc
+index 7053088..eb22ef2 100644
+--- a/src/c-writer.cc
++++ b/src/c-writer.cc
+@@ -4409,8 +4409,32 @@ void CWriter::Write(const ExprList& exprs) {
+         return;
+       }
+ 
+-      case ExprType::AtomicWait:
+-      case ExprType::AtomicNotify:
++      case ExprType::AtomicWait: {
++        // Host-provided: u32 wasm_rt_atomic_wait{32,64}(void* mem, u64 addr, expected, s64 timeout_ns)
++        auto* e = cast<AtomicWaitExpr>(&expr);
++        Memory* memory = module_->memories[module_->GetMemoryIndex(e->memidx)];
++        const bool is64 = e->opcode == Opcode::MemoryAtomicWait64;
++        Write(StackVar(2, Type::I32), " = ",
++              is64 ? "wasm_rt_atomic_wait64(" : "wasm_rt_atomic_wait32(",
++              ExternalInstancePtr(ModuleFieldType::Memory, memory->name), ", ");
++        WriteMemoryAddress(2, memory, e->offset);
++        Write(", ", StackVar(1), ", (s64)", StackVar(0), ");", Newline());
++        DropTypes(3);
++        PushType(Type::I32);
++        break;
++      }
++      case ExprType::AtomicNotify: {
++        // Host-provided: u32 wasm_rt_atomic_notify(void* mem, u64 addr, u32 count)
++        auto* e = cast<AtomicNotifyExpr>(&expr);
++        Memory* memory = module_->memories[module_->GetMemoryIndex(e->memidx)];
++        Write(StackVar(1, Type::I32), " = wasm_rt_atomic_notify(",
++              ExternalInstancePtr(ModuleFieldType::Memory, memory->name), ", ");
++        WriteMemoryAddress(1, memory, e->offset);
++        Write(", ", StackVar(0), ");", Newline());
++        DropTypes(2);
++        PushType(Type::I32);
++        break;
++      }
+       case ExprType::CallRef:
+       case ExprType::ReturnCallRef:
+       case ExprType::Quaternary:
+diff --git a/src/template/wasm2c_atomicops.declarations.c b/src/template/wasm2c_atomicops.declarations.c
+index d3ea511..531cc49 100644
+--- a/src/template/wasm2c_atomicops.declarations.c
++++ b/src/template/wasm2c_atomicops.declarations.c
+@@ -4,6 +4,19 @@
+ #error "C11 is required for Wasm threads and shared memory support"
+ #endif
+ 
++// memory.atomic.wait32/wait64/notify are implemented by the embedder, which
++// usually shares the parking table with host threads waiting on the same
++// addresses. `memory` points to the wasm_rt_(shared_)memory_t accessed.
++uint32_t wasm_rt_atomic_wait32(void* memory,
++                               uint64_t addr,
++                               uint32_t expected,
++                               int64_t timeout_ns);
++uint32_t wasm_rt_atomic_wait64(void* memory,
++                               uint64_t addr,
++                               uint64_t expected,
++                               int64_t timeout_ns);
++uint32_t wasm_rt_atomic_notify(void* memory, uint64_t addr, uint32_t count);
++
+ #define ATOMIC_ALIGNMENT_CHECK(addr, t1) \
+   if (UNLIKELY(addr % sizeof(t1))) {     \
+     TRAP(UNALIGNED);                     \
+-- 
+2.50.1 (Apple Git-155)
+

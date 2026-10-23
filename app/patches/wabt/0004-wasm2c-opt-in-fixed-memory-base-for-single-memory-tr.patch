@@ -1,0 +1,36 @@
+From c198fef2bce12c5a27eac2e29942662edbc636f0 Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Sat, 10 Oct 2026 23:37:31 +0200
+Subject: [PATCH 4/4] wasm2c: opt-in fixed memory base for single-memory trusted
+ modules
+
+WASM_RT_NONCONFORMING_FIXED_MEMORY_BASE: memory accesses add the address
+to wasm_rt_fixed_memory_base, a const global the host sets before
+instantiating the module, instead of loading the instance's memory and
+its data pointer again after every store and call.
+---
+ src/template/wasm2c.declarations.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/template/wasm2c.declarations.c b/src/template/wasm2c.declarations.c
+index 080fead..0c958ff 100644
+--- a/src/template/wasm2c.declarations.c
++++ b/src/template/wasm2c.declarations.c
+@@ -16,6 +16,14 @@
+ // A pointer for an object of size n.
+ #if WABT_BIG_ENDIAN
+ #define MEM_ADDR(mem, addr, n) ((mem)->data_end - (addr) - (n))
++#elif WASM_RT_NONCONFORMING_FIXED_MEMORY_BASE
++// WASM_RT_NONCONFORMING_FIXED_MEMORY_BASE: the module's single memory is
++// mapped once, at an address that never changes, published by the host in
++// `wasm_rt_fixed_memory_base` before the module is instantiated. Declared
++// const, the base stays in a register: through the instance it is reloaded
++// (two dependent loads) after every store and call, which may alias it.
++extern uint8_t* const wasm_rt_fixed_memory_base;
++#define MEM_ADDR(mem, addr, n) (wasm_rt_fixed_memory_base + (addr))
+ #else
+ #define MEM_ADDR(mem, addr, n) &((mem)->data[addr])
+ #endif
+-- 
+2.50.1 (Apple Git-155)
+

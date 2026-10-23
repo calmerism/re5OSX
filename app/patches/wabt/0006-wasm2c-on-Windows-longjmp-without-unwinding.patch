@@ -1,0 +1,38 @@
+From cf6281704cf44dd47ca361e1dcd680dc02c6d6fa Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Mon, 12 Oct 2026 20:37:14 +0200
+Subject: [PATCH 6/6] wasm2c: on Windows, longjmp without unwinding
+
+MSVC's CRT longjmp unwinds the stack to the setjmp frame like an
+exception, through every frame in between: the embedder's frames that a
+trap crosses (an import that calls back into the module, a host function
+that unwinds on purpose) get their handlers run, and Rust aborts when it
+unwinds a function that must not unwind. A jmp_buf whose frame is null
+makes longjmp restore the registers only, as siglongjmp does on other
+systems, so traps behave the same everywhere. x64 and ARM64: the jmp_buf
+of 32-bit x86 has no such field.
+---
+ wasm2c/wasm-rt.h | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/wasm2c/wasm-rt.h b/wasm2c/wasm-rt.h
+index 83a1365..f844896 100644
+--- a/wasm2c/wasm-rt.h
++++ b/wasm2c/wasm-rt.h
+@@ -612,6 +612,16 @@ typedef struct {
+ 
+ #ifndef _WIN32
+ #define WASM_RT_LONGJMP_UNCHECKED(buf, val) siglongjmp(buf, val)
++#elif defined(_M_X64) || defined(_M_ARM64)
++/**
++ * The CRT's longjmp unwinds the stack to the setjmp frame as an exception
++ * would, running the handlers of the frames in between, the embedder's
++ * too (Rust aborts when a function that must not unwind is unwound).
++ * Without a frame in the jmp_buf it restores the registers only, as
++ * longjmp does elsewhere.
++ */
++#define WASM_RT_LONGJMP_UNCHECKED(buf, val) \
++  (((_JUMP_BUFFER*)(buf))->Frame = 0, longjmp(buf, val))
+ #else
+ #define WASM_RT_LONGJMP_UNCHECKED(buf, val) longjmp(buf, val)
+ #endif

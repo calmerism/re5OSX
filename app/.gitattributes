@@ -1,0 +1,3 @@
+# LF everywhere, Windows checkouts too: the tasks are bash scripts and the
+# patches must match the LF sources they apply to.
+* text=auto eol=lf

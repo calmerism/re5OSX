@@ -1,0 +1,10 @@
+# Toolchain and developer tasks, for everyone: `mise run <task>` (`mise
+# tasks` lists them) installs the tools below on first use; cargo by hand
+# goes through mise too (an activated shell, or `mise exec -- cargo ...`).
+# The tasks are scripts in tasks/, next to this file. Personal settings go
+# in config.local.toml here (ignored by git) under [env].
+
+[tools]
+rust = { version = "stable", targets = "wasm32-unknown-unknown" }
+cmake = "4.4.4"
+"cargo:cargo-packager" = { version = "0.11.8", os = ["macos", "linux"] }

@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 09:00:00 +0200
+Subject: [PATCH] wgpu-core: one command buffer per pass
+
+Each render or compute pass took two raw command buffers: its own, and
+one for the barriers (and discard fixups, query resets) before it,
+recorded after the pass and inserted ahead of it. Command buffers cost
+on their own on some platforms: on Mali each holds ~0.4 MB of host
+memory, allocated and freed as pools are reused (~7 % of a game's CPU
+time on a Pixel 8a went to that), and Metal hands each to the kernel and
+releases it after completion.
+
+Where the hal encoder can suspend command buffers (wgpu-hal 0005: Metal,
+not Vulkan, where passes keep their two command buffers), a
+pass's command buffer is suspended at its end, and the barriers before
+the next pass go at the end of it: they run in the same order, between
+the two passes. Commands recorded between passes resume it too. The last
+command buffer is ended when the encoder finishes, and before a deferred
+query resolve notes its insertion point (what is recorded later must not
+go before the resolve).
+---
+diff --git a/src/command/compute.rs b/src/command/compute.rs
+index 2312e90..b9fb12a 100644
+--- a/src/command/compute.rs
++++ b/src/command/compute.rs
+@@ -922,14 +922,14 @@ pub(super) fn encode_compute_pass(
+     } = state;
+ 
+     // Stop the current command encoder.
+-    parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
++    parent_state.raw_encoder.close_pass().map_pass_err(pass_scope)?;
+ 
+     // Create a new command encoder, which we will insert _before_ the body of the compute pass.
+     //
+     // Use that buffer to insert barriers and clear discarded images.
+     let transit = parent_state
+         .raw_encoder
+-        .open_pass(hal_label(
++        .open_before_pass(hal_label(
+             Some("(wgpu internal) Pre Pass"),
+             device.instance_flags,
+         ))
+@@ -951,7 +951,7 @@ pub(super) fn encode_compute_pass(
+     // Close the command encoder, and swap it with the previous.
+     parent_state
+         .raw_encoder
+-        .close_and_swap()
++        .close_before_pass()
+         .map_pass_err(pass_scope)?;
+ 
+     Ok(())
+diff --git a/src/command/mod.rs b/src/command/mod.rs
+index 97f4cb9..efbf13d 100644
+--- a/src/command/mod.rs
++++ b/src/command/mod.rs
+@@ -620,6 +620,22 @@ pub(crate) struct InnerCommandEncoder {
+     /// [`wgpu_hal::CommandEncoder`]: hal::CommandEncoder
+     pub(crate) is_open: bool,
+ 
++    /// True if the last command buffer in `list` was suspended, not ended
++    /// ([`hal::CommandEncoder::suspend_encoding`]): recording can resume
++    /// into it instead of beginning another command buffer.
++    ///
++    /// A pass's command buffer is suspended at its end, and the barriers
++    /// before the next pass go at the end of it, where they run in the same
++    /// order as in a command buffer of their own between the two: one
++    /// command buffer per pass, not two. Command buffers have a cost of
++    /// their own on some platforms (each holds ~0.4 MB of host memory on
++    /// Mali; Metal hands each to the kernel and releases it after).
++    pub(crate) last_suspended: bool,
++
++    /// While a pass's barriers are being recorded ([`Self::open_before_pass`]):
++    /// true if the command buffer before the pass's was suspended.
++    pub(crate) suspended_before_pass: bool,
++
+     /// Tracks which API is being used to encode commands.
+     ///
+     /// Mixing the wgpu encoding API with access to the raw hal encoder via
+@@ -725,6 +741,7 @@ impl InnerCommandEncoder {
+     /// [l]: InnerCommandEncoder::list
+     pub(crate) fn close(&mut self) -> Result<(), DeviceError> {
+         assert!(self.is_open);
++        debug_assert!(!self.last_suspended);
+         self.is_open = false;
+ 
+         let cmd_buf =
+@@ -745,6 +762,36 @@ impl InnerCommandEncoder {
+     ///
+     /// [l]: InnerCommandEncoder::list
+     fn close_if_open(&mut self) -> Result<(), DeviceError> {
++        if self.is_open {
++            self.is_open = false;
++            let suspend = self.raw.can_suspend();
++            let cmd_buf = if suspend {
++                unsafe { self.raw.suspend_encoding() }
++            } else {
++                unsafe { self.raw.end_encoding() }
++            }
++            .map_err(|e| self.device.handle_hal_error(e))?;
++            self.list.push(cmd_buf);
++            self.last_suspended = suspend;
++        }
++
++        Ok(())
++    }
++
++    /// Finish every command buffer: the open one, if any, and the last
++    /// one in [`self.list`][l] if it was only suspended. Nothing recorded
++    /// later goes before what is in the list now.
++    ///
++    /// On return, the underlying hal encoder is closed.
++    ///
++    /// [l]: InnerCommandEncoder::list
++    pub(crate) fn seal(&mut self) -> Result<(), DeviceError> {
++        if !self.is_open && self.last_suspended {
++            let cmd_buf = self.list.pop().unwrap();
++            unsafe { self.raw.resume_encoding(cmd_buf) };
++            self.is_open = true;
++        }
++        self.last_suspended = false;
+         if self.is_open {
+             self.is_open = false;
+             let cmd_buf =
+@@ -755,6 +802,72 @@ impl InnerCommandEncoder {
+         Ok(())
+     }
+ 
++    /// Put the raw encoder in the "recording" state: resume the last
++    /// command buffer if it was suspended, or begin another.
++    fn begin_or_resume(&mut self) -> Result<(), DeviceError> {
++        if self.last_suspended {
++            let cmd_buf = self.list.pop().unwrap();
++            unsafe { self.raw.resume_encoding(cmd_buf) };
++            self.last_suspended = false;
++        } else {
++            let hal_label = hal_label(Some(self.label.as_str()), self.device.instance_flags);
++            unsafe { self.raw.begin_encoding(hal_label) }
++                .map_err(|e| self.device.handle_hal_error(e))?;
++        }
++        self.is_open = true;
++        Ok(())
++    }
++
++    /// Finish a render or compute pass's command buffer, suspended if the
++    /// raw encoder can: [`Self::open_before_pass`] then records the pass's
++    /// barriers at the end of the command buffer before it, if that one
++    /// was suspended too, and the next commands can go at the end of this
++    /// one.
++    ///
++    /// On return, the underlying hal encoder is closed.
++    pub(crate) fn close_pass(&mut self) -> Result<(), DeviceError> {
++        assert!(self.is_open);
++        self.is_open = false;
++        let suspend = self.raw.can_suspend();
++        let cmd_buf = if suspend {
++            unsafe { self.raw.suspend_encoding() }
++        } else {
++            unsafe { self.raw.end_encoding() }
++        }
++        .map_err(|e| self.device.handle_hal_error(e))?;
++        self.suspended_before_pass = self.last_suspended;
++        self.list.push(cmd_buf);
++        self.last_suspended = suspend;
++        Ok(())
++    }
++
++    /// Begin recording what must run just before the pass that
++    /// [`Self::close_pass`] closed (its barriers): at the end of the command
++    /// buffer before the pass's, if it was suspended, or in a new one.
++    /// [`Self::close_before_pass`] puts it in place.
++    pub(crate) fn open_before_pass(
++        &mut self,
++        label: Option<&str>,
++    ) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
++        assert!(!self.is_open);
++        if self.suspended_before_pass {
++            let cmd_buf = self.list.remove(self.list.len() - 2);
++            unsafe { self.raw.resume_encoding(cmd_buf) };
++            self.is_open = true;
++            Ok(self.raw.as_mut())
++        } else {
++            self.open_pass(label)
++        }
++    }
++
++    /// End the command buffer [`Self::open_before_pass`] opened and put it
++    /// just before the pass's, which stays last. It is not resumed again:
++    /// the pass follows it.
++    pub(crate) fn close_before_pass(&mut self) -> Result<(), DeviceError> {
++        self.suspended_before_pass = false;
++        self.close_and_swap()
++    }
++
+     /// If the command encoder is not open, begin recording a new command buffer.
+     ///
+     /// If the command encoder was already open, does nothing.
+@@ -762,10 +875,7 @@ impl InnerCommandEncoder {
+     /// In both cases, returns a reference to the raw encoder.
+     fn open_if_closed(&mut self) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+         if !self.is_open {
+-            let hal_label = hal_label(Some(self.label.as_str()), self.device.instance_flags);
+-            unsafe { self.raw.begin_encoding(hal_label) }
+-                .map_err(|e| self.device.handle_hal_error(e))?;
+-            self.is_open = true;
++            self.begin_or_resume()?;
+         }
+ 
+         Ok(self.raw.as_mut())
+@@ -776,10 +886,7 @@ impl InnerCommandEncoder {
+     /// The underlying hal encoder is put in the "recording" state.
+     pub(crate) fn open(&mut self) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+         if !self.is_open {
+-            let hal_label = hal_label(Some(self.label.as_str()), self.device.instance_flags);
+-            unsafe { self.raw.begin_encoding(hal_label) }
+-                .map_err(|e| self.device.handle_hal_error(e))?;
+-            self.is_open = true;
++            self.begin_or_resume()?;
+         }
+ 
+         Ok(self.raw.as_mut())
+@@ -925,6 +1032,8 @@ impl CommandEncoder {
+                         list: Vec::new(),
+                         device: device.clone(),
+                         is_open: false,
++                        last_suspended: false,
++                        suspended_before_pass: false,
+                         api: EncodingApi::Undecided,
+                         label: label.to_string(),
+                     },
+@@ -1305,8 +1414,9 @@ impl CommandEncoder {
+             ))?;
+         }
+ 
+-        // Close the encoder, unless it was closed already by a render or compute pass.
+-        cmd_buf_data.encoder.close_if_open()?;
++        // Close the encoder, unless it was closed already by a render or
++        // compute pass, and end a suspended command buffer.
++        cmd_buf_data.encoder.seal()?;
+ 
+         // Note: if we want to stop tracking the swapchain texture view,
+         // this is the place to do it.
+diff --git a/src/command/query.rs b/src/command/query.rs
+index 59b3d48..826cba5 100644
+--- a/src/command/query.rs
++++ b/src/command/query.rs
+@@ -596,7 +596,8 @@ pub(super) fn resolve_query_set(
+             );
+         }
+     } else {
+-        state.raw_encoder.close_if_open()?;
++        // Sealed: what is recorded later must not go before the resolve.
++        state.raw_encoder.seal()?;
+         let insertion_point = state.raw_encoder.list.len();
+ 
+         state
+diff --git a/src/command/render.rs b/src/command/render.rs
+index b46f9a7..0a8382c 100644
+--- a/src/command/render.rs
++++ b/src/command/render.rs
+@@ -2720,7 +2720,7 @@ pub(super) fn encode_render_pass(
+ 
+         let pending_discard_init_fixups = state.pass.pending_discard_init_fixups;
+ 
+-        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
++        parent_state.raw_encoder.close_pass().map_pass_err(pass_scope)?;
+         (trackers, pending_discard_init_fixups, pending_query_resets)
+     };
+ 
+@@ -2729,7 +2729,7 @@ pub(super) fn encode_render_pass(
+ 
+     {
+         let transit = encoder
+-            .open_pass(hal_label(
++            .open_before_pass(hal_label(
+                 Some("(wgpu internal) Pre Pass"),
+                 device.instance_flags,
+             ))
+@@ -2769,7 +2769,7 @@ pub(super) fn encode_render_pass(
+         }
+     }
+ 
+-    encoder.close_and_swap().map_pass_err(pass_scope)?;
++    encoder.close_before_pass().map_pass_err(pass_scope)?;
+ 
+     Ok(())
+ }
+diff --git a/src/device/queue.rs b/src/device/queue.rs
+index 9b02985..d3c7577 100644
+--- a/src/device/queue.rs
++++ b/src/device/queue.rs
+@@ -484,6 +484,8 @@ impl PendingWrites {
+                     list: vec![cmd_buf],
+                     device: device.clone(),
+                     is_open: false,
++                    last_suspended: false,
++                    suspended_before_pass: false,
+                     api: crate::command::EncodingApi::InternalUse,
+                     label: "(wgpu internal) PendingWrites command encoder".into(),
+                 },

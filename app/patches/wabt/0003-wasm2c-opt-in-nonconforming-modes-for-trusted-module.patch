@@ -1,0 +1,128 @@
+From 6fe99450d567110f4fc3eed44c22526fadca0c7a Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Sat, 10 Oct 2026 14:31:52 +0200
+Subject: [PATCH 3/3] wasm2c: opt-in nonconforming modes for trusted modules
+
+WASM_RT_NONCONFORMING_SKIP_BOUNDS_CHECKS: no per-access bounds checks
+(needed for fast memory64, where guard pages cannot be used).
+WASM_RT_NONCONFORMING_PLAIN_SHARED_ACCESS: plain copies instead of
+volatile relaxed atomics for ordinary accesses to shared memories.
+WASM_RT_NONCONFORMING_UNCHECKED_CALL_INDIRECT: no call_indirect checks.
+---
+ src/template/wasm2c.declarations.c           | 23 ++++++++++++++++-
+ src/template/wasm2c_atomicops.declarations.c | 26 +++++++++++++++-----
+ 2 files changed, 42 insertions(+), 7 deletions(-)
+
+diff --git a/src/template/wasm2c.declarations.c b/src/template/wasm2c.declarations.c
+index 20f494e..080fead 100644
+--- a/src/template/wasm2c.declarations.c
++++ b/src/template/wasm2c.declarations.c
+@@ -120,10 +120,26 @@ W2C_COLD_FUNC static bool func_types_eq_slowpath(
+ 
+ #define DO_CALL_INDIRECT(table, t, x, ...) ((t)table.data[x].func)(__VA_ARGS__)
+ 
++// WASM_RT_NONCONFORMING_UNCHECKED_CALL_INDIRECT skips the table bounds and
++// signature checks of call_indirect. Only for trusted modules.
++#if WASM_RT_NONCONFORMING_UNCHECKED_CALL_INDIRECT
++#define CALL_INDIRECT(table, t, ft, x, ...) \
++  DO_CALL_INDIRECT(table, t, x, __VA_ARGS__)
++#else
+ #define CALL_INDIRECT(table, t, ft, x, ...) \
+   (CHECK_CALL_INDIRECT(table, ft, x),       \
+    DO_CALL_INDIRECT(table, t, x, __VA_ARGS__))
++#endif
+ 
++// WASM_RT_NONCONFORMING_SKIP_BOUNDS_CHECKS removes the bounds checks of
++// individual loads and stores (bulk memory operations keep theirs). An
++// out-of-bounds access is undefined behaviour instead of a trap, so this is
++// only for trusted modules.
++#if WASM_RT_NONCONFORMING_SKIP_BOUNDS_CHECKS
++static inline uint64_t checked_add_u64(uint64_t a, uint64_t b) {
++  return a + b;
++}
++#else
+ static inline uint64_t checked_add_u64(uint64_t a, uint64_t b) {
+   uint64_t ret;
+ #if __has_builtin(__builtin_add_overflow)
+@@ -139,6 +155,7 @@ static inline uint64_t checked_add_u64(uint64_t a, uint64_t b) {
+ #endif
+   return ret;
+ }
++#endif
+ 
+ #define RANGE_CHECK(mem, offset, len)            \
+   do {                                           \
+@@ -162,7 +179,7 @@ static inline uint64_t checked_add_u64(uint64_t a, uint64_t b) {
+ // default-page-size, 32-bit memories. It may do nothing at all
+ // (if hardware bounds-checking is enabled via guard pages)
+ // or it may do a slightly faster RANGE_CHECK.
+-#if WASM_RT_MEMCHECK_GUARD_PAGES
++#if WASM_RT_MEMCHECK_GUARD_PAGES || WASM_RT_NONCONFORMING_SKIP_BOUNDS_CHECKS
+ #define MEMCHECK_DEFAULT32(mem, local_memory_size, a, t) \
+   WASM_RT_CHECK_BASE(mem);
+ #else
+@@ -180,9 +197,13 @@ static inline uint64_t checked_add_u64(uint64_t a, uint64_t b) {
+ #endif
+ 
+ // MEMCHECK_GENERAL can be used for any memory
++#if WASM_RT_NONCONFORMING_SKIP_BOUNDS_CHECKS
++#define MEMCHECK_GENERAL(mem, a, t) WASM_RT_CHECK_BASE(mem);
++#else
+ #define MEMCHECK_GENERAL(mem, a, t) \
+   WASM_RT_CHECK_BASE(mem);          \
+   RANGE_CHECK(mem, a, sizeof(t));
++#endif
+ 
+ // When using guard pages, reads have to be immediately consumed so that OOB
+ // trap checks are applied in the right place, and not optimized away. This is
+diff --git a/src/template/wasm2c_atomicops.declarations.c b/src/template/wasm2c_atomicops.declarations.c
+index 531cc49..0e4f9f4 100644
+--- a/src/template/wasm2c_atomicops.declarations.c
++++ b/src/template/wasm2c_atomicops.declarations.c
+@@ -22,13 +22,29 @@ uint32_t wasm_rt_atomic_notify(void* memory, uint64_t addr, uint32_t count);
+     TRAP(UNALIGNED);                     \
+   }
+ 
++// Ordinary (non-atomic) loads and stores on a shared memory. By default they
++// are relaxed atomics on a volatile pointer, which keeps the C compiler from
++// merging or reordering them. WASM_RT_NONCONFORMING_PLAIN_SHARED_ACCESS turns
++// them into plain copies, which is what Wasm engines emit for these
++// instructions; formally a data race in C, but it lets the compiler optimise
++// memory accesses again.
++#if WASM_RT_NONCONFORMING_PLAIN_SHARED_ACCESS
++#define SHARED_PLAIN_LOAD(result, t, ptr) \
++  wasm_rt_memcpy(&(result), (const void*)(uintptr_t)(ptr), sizeof(t))
++#define SHARED_PLAIN_STORE(t, ptr, value) \
++  wasm_rt_memcpy((void*)(uintptr_t)(ptr), &(value), sizeof(t))
++#else
++#define SHARED_PLAIN_LOAD(result, t, ptr) \
++  (result) = atomic_load_explicit((_Atomic volatile t*)(ptr), memory_order_relaxed)
++#define SHARED_PLAIN_STORE(t, ptr, value) \
++  atomic_store_explicit((_Atomic volatile t*)(ptr), (value), memory_order_relaxed)
++#endif
++
+ #define DEFINE_SHARED_LOAD(name, t1, t2, t3, force_read)                      \
+   static inline t3 name##_unchecked(uint8_t* const wasm_rt_local_memory_base, \
+                                     wasm_rt_shared_memory_t* mem, u64 addr) { \
+     t1 result;                                                                \
+-    result = atomic_load_explicit(                                            \
+-        (_Atomic volatile t1*)MEM_ADDR(mem, addr, sizeof(t1)),                \
+-        memory_order_relaxed);                                                \
++    SHARED_PLAIN_LOAD(result, t1, MEM_ADDR(mem, addr, sizeof(t1)));          \
+     t3 ret = (t3)(t2)result;                                                  \
+     force_read(ret);                                                          \
+     return ret;                                                               \
+@@ -55,9 +71,7 @@ DEFINE_SHARED_LOAD(i64_load32_u_shared, u32, u64, u64, FORCE_READ_INT)
+       uint8_t* const wasm_rt_local_memory_base, wasm_rt_shared_memory_t* mem, \
+       u64 addr, t2 value) {                                                   \
+     t1 wrapped = (t1)value;                                                   \
+-    atomic_store_explicit(                                                    \
+-        (_Atomic volatile t1*)MEM_ADDR(mem, addr, sizeof(t1)), wrapped,       \
+-        memory_order_relaxed);                                                \
++    SHARED_PLAIN_STORE(t1, MEM_ADDR(mem, addr, sizeof(t1)), wrapped);        \
+   }                                                                           \
+   DEF_MEM_CHECKS1(name, _shared_, t1, , void, t2)
+ 
+-- 
+2.50.1 (Apple Git-155)
+

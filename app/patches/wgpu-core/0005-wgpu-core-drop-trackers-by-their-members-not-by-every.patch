@@ -1,0 +1,40 @@
+From 94b6e79dbb6f21925a2fd33def5947efcfcc23c1 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 22:04:28 +0200
+Subject: [PATCH] wgpu-core: drop trackers by their members, not by every
+ resource index
+
+Each command buffer has trackers whose tables span every buffer and
+texture index of the device; dropping them after the command buffer is
+encoded checked every entry of those tables for a resource to release.
+With ~200,000 resources and a few command buffers a frame, that was about
+a third of the encoding threads' time (drop_glue<Tracker>). Now only the
+members are dropped, through the ownership bits, as clear does.
+
+---
+ src/track/metadata.rs | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/track/metadata.rs b/src/track/metadata.rs
+index 6140970..aeaf38e 100644
+--- a/src/track/metadata.rs
++++ b/src/track/metadata.rs
+@@ -146,6 +146,18 @@ impl<T: Clone> ResourceMetadata<T> {
+     }
+ }
+ 
++impl<T: Clone> Drop for ResourceMetadata<T> {
++    /// Drops the members only. (re5osx: a command buffer's trackers span
++    /// every resource index of the device, and dropping the table checked
++    /// each entry: with tens of thousands of resources, a third of the time
++    /// encoding a command buffer.)
++    fn drop(&mut self) {
++        self.clear();
++        // SAFETY: every entry left is `None`: there is nothing to drop.
++        unsafe { self.resources.set_len(0) };
++    }
++}
++
+ /// A source of resource metadata.
+ ///
+ /// This is used to abstract over the various places

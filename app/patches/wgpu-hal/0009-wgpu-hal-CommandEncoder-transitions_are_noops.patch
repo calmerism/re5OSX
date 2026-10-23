@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:00:00 +0200
+Subject: [PATCH] wgpu-hal: CommandEncoder::transitions_are_noops
+
+Whether transition_buffers and transition_textures record nothing (true
+on Metal, which tracks hazards between the encoders of a command
+buffer): wgpu-core then records a pass that needs only barriers before
+it in the command buffer before it (wgpu-core 0009).
+---
+diff --git a/src/dynamic/command.rs b/src/dynamic/command.rs
+index 0a519ac..2b97668 100644
+--- a/src/dynamic/command.rs
++++ b/src/dynamic/command.rs
+@@ -24,6 +24,8 @@ pub trait DynCommandEncoder: DynResource + core::fmt::Debug {
+ 
+     fn can_suspend(&self) -> bool;
+ 
++    fn transitions_are_noops(&self) -> bool;
++
+     unsafe fn suspend_encoding(&mut self) -> Result<Box<dyn DynCommandBuffer>, DeviceError>;
+ 
+     unsafe fn resume_encoding(&mut self, command_buffer: Box<dyn DynCommandBuffer>);
+@@ -262,6 +264,10 @@ impl<C: CommandEncoder + DynResource> DynCommandEncoder for C {
+         C::can_suspend(self)
+     }
+ 
++    fn transitions_are_noops(&self) -> bool {
++        C::transitions_are_noops(self)
++    }
++
+     unsafe fn suspend_encoding(&mut self) -> Result<Box<dyn DynCommandBuffer>, DeviceError> {
+         unsafe { C::suspend_encoding(self) }.map(|cb| {
+             let boxed_command_buffer: Box<<C::A as Api>::CommandBuffer> = Box::new(cb);
+diff --git a/src/lib.rs b/src/lib.rs
+index f4a84af..202bc76 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1438,6 +1438,17 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
+         false
+     }
+ 
++    /// Whether [`transition_buffers`] and [`transition_textures`] record
++    /// nothing (the API orders commands itself, as Metal): commands
++    /// recorded after others in a command buffer run after them, with or
++    /// without barriers between.
++    ///
++    /// [`transition_buffers`]: CommandEncoder::transition_buffers
++    /// [`transition_textures`]: CommandEncoder::transition_textures
++    fn transitions_are_noops(&self) -> bool {
++        false
++    }
++
+     /// Like [`end_encoding`], but the returned [`CommandBuffer`] can be
+     /// resumed ([`resume_encoding`]) and recorded into further. Other
+     /// command buffers may be begun and ended on this encoder meanwhile.
+diff --git a/src/metal/command.rs b/src/metal/command.rs
+--- a/src/metal/command.rs
++++ b/src/metal/command.rs
+@@ -607,6 +607,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         true
+     }
+ 
++    /// Metal tracks hazards between the encoders of a command buffer.
++    fn transitions_are_noops(&self) -> bool {
++        true
++    }
++
+     unsafe fn resume_encoding(&mut self, command_buffer: super::CommandBuffer) {
+         debug_assert!(!self.recording && self.raw_cmd_buf.is_none());
+         let mut command_buffer = command_buffer;
+-- 
+2.50.1
+

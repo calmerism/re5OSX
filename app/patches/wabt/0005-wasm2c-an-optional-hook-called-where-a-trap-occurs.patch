@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Mon, 12 Oct 2026 10:30:00 +0200
+Subject: [PATCH 5/5] wasm2c: an optional hook called where a trap occurs
+
+wasm_rt_trap_hook, if set, is called with the reason before execution
+unwinds to wasm_rt_impl_try, while the trapping call stack is still
+there: the host can record a backtrace where a debugger cannot attach
+(e.g. a release app on a phone). For `unreachable` it also gets the line
+of the generated code: UNREACHABLE passes __LINE__, which also keeps the
+compiler from merging a function's trap sites into one.
+WASM_RT_TRAP_HANDLER replaces the setjmp/longjmp scheme as a whole; this
+keeps it.
+---
+diff --git a/src/template/wasm2c.declarations.c b/src/template/wasm2c.declarations.c
+index 0c958ff..33b4fa5 100644
+--- a/src/template/wasm2c.declarations.c
++++ b/src/template/wasm2c.declarations.c
+@@ -92,7 +92,7 @@ static inline void wasm_rt_segue_write_base(void* base) {
+ #define FUNC_EPILOGUE
+ #endif
+ 
+-#define UNREACHABLE TRAP(UNREACHABLE)
++#define UNREACHABLE (wasm_rt_trap_unreachable(__LINE__), 0)
+ 
+ #if defined(__clang__) || defined(__GNUC__)
+ #define W2C_COLD_FUNC __attribute__((noinline, cold))
+diff --git a/wasm2c/wasm-rt-impl.c b/wasm2c/wasm-rt-impl.c
+index 0cf0723..7aafd4e 100644
+--- a/wasm2c/wasm-rt-impl.c
++++ b/wasm2c/wasm-rt-impl.c
+@@ -86,8 +86,23 @@ WASM_RT_THREAD_LOCAL wasm_rt_jmp_buf g_wasm_rt_jmp_buf;
+ extern void WASM_RT_TRAP_HANDLER(wasm_rt_trap_t code);
+ #endif
+ 
++void (*wasm_rt_trap_hook)(wasm_rt_trap_t, uint32_t) = NULL;
++
++static WASM_RT_NO_RETURN void trap_at(wasm_rt_trap_t code, uint32_t line);
++
+ void wasm_rt_trap(wasm_rt_trap_t code) {
++  trap_at(code, 0);
++}
++
++void wasm_rt_trap_unreachable(uint32_t line) {
++  trap_at(WASM_RT_TRAP_UNREACHABLE, line);
++}
++
++static void trap_at(wasm_rt_trap_t code, uint32_t line) {
+   assert(code != WASM_RT_TRAP_NONE);
++  if (wasm_rt_trap_hook) {
++    wasm_rt_trap_hook(code, line);
++  }
+ #if WASM_RT_STACK_DEPTH_COUNT
+   wasm_rt_call_stack_depth = wasm_rt_saved_call_stack_depth;
+ #endif
+diff --git a/wasm2c/wasm-rt.h b/wasm2c/wasm-rt.h
+index aa43586..83a1365 100644
+--- a/wasm2c/wasm-rt.h
++++ b/wasm2c/wasm-rt.h
+@@ -631,6 +631,20 @@ typedef struct {
+  */
+ WASM_RT_NO_RETURN void wasm_rt_trap(wasm_rt_trap_t);
+ 
++/**
++ * `wasm_rt_trap(WASM_RT_TRAP_UNREACHABLE)` from line `line` of the generated
++ * code (each site distinct: the compiler cannot merge them).
++ */
++WASM_RT_NO_RETURN void wasm_rt_trap_unreachable(uint32_t line);
++
++/**
++ * If set, called with the reason when a trap occurs, and for `unreachable`
++ * the line of the generated code (0 otherwise), before execution unwinds to
++ * `wasm_rt_impl_try`: the trapping call stack is still there (for a
++ * backtrace). It must return.
++ */
++extern void (*wasm_rt_trap_hook)(wasm_rt_trap_t, uint32_t line);
++
+ /** Return a human readable error string based on a trap type. */
+ const char* wasm_rt_strerror(wasm_rt_trap_t trap);
+ 

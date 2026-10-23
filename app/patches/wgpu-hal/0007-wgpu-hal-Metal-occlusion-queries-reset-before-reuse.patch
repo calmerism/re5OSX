@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 08:00:00 +0200
+Subject: [PATCH] wgpu-hal: Metal occlusion queries reset before reuse
+
+reset_queries did nothing on Metal, but a render pass writes an
+occlusion query's slot in the visibility result buffer only when a draw
+runs while the query is active. A query begun and ended with no draw in
+between (a D3D11 query that spans two render passes has such a part in
+the first) then read whatever the slot's last use had left there.
+
+A game that measures the sun's visibility with occlusion queries reused
+its slots every few hundred frames: the sun's query read tens of
+thousands of samples (another query's) with no sky on screen, and the
+lens flare showed through walls and floors.
+
+reset_queries now zeroes the queries' slots with a blit, as Vulkan's
+vkCmdResetQueryPool does; wgpu-core records it before the render pass.
+---
+diff --git a/src/metal/command.rs b/src/metal/command.rs
+index 46ee564..0d0d2ba 100644
+--- a/src/metal/command.rs
++++ b/src/metal/command.rs
+@@ -903,7 +903,21 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         };
+     }
+ 
+-    unsafe fn reset_queries(&mut self, _set: &super::QuerySet, _range: Range<u32>) {}
++    unsafe fn reset_queries(&mut self, set: &super::QuerySet, range: Range<u32>) {
++        // A render pass writes an occlusion query's result only if a draw
++        // runs while the query is active: zeroed here, a query begun and
++        // ended with no draw between reads 0, not what the slot's last use
++        // left there.
++        if let wgt::QueryType::Occlusion = set.ty {
++            let size = crate::QUERY_SIZE as usize;
++            let encoder = self.enter_blit();
++            encoder.fillBuffer_range_value(
++                &set.raw_buffer,
++                NSRange::new(range.start as usize * size, (range.end - range.start) as usize * size),
++                0,
++            );
++        }
++    }
+ 
+     unsafe fn copy_query_results(
+         &mut self,

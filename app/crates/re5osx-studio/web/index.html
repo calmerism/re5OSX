@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#0e0f11">
+<title>re5OSX Studio</title>
+<link rel="icon" href="/logo.png">
+<link rel="stylesheet" href="/style.css">
+<script type="importmap"><!--IMPORTMAP--></script>
+<link rel="modulepreload" href="/studio.js">
+</head>
+<body>
+<script type="module">
+import init from "/studio.js";
+init({ module_or_path: "/studio_bg.wasm" });
+</script>
+</body>
+</html>

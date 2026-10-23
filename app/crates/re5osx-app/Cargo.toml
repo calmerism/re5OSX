@@ -1,0 +1,14 @@
+[package]
+name = "re5osx-app"
+description = "The app as a static library without the game's code, linked with it on the player's Mac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+re5osx.workspace = true
+re5osx-runtime.workspace = true

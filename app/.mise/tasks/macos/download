@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#MISE description="Build re5OSX.app and its DMG, the one download: the launcher, and the kit that makes re5OSX on the player's Mac"
+#MISE depends=["setup"]
+# The app carries nothing of the game: re5osx-game is built with
+# RE5OSX_GAME_LINK=external (only its Rust side, generated from
+# $RE5OSX_GAME_DIR), and the player's Mac compiles their own game.wasm and
+# links it with the kit's libre5osx_app.a (platform/macos/link-app).
+set -euo pipefail
+# The kit's library without debug info (stripping the archive afterwards
+# leaves duplicate symbols for ld to warn about).
+export CARGO_PROFILE_RELEASE_DEBUG=false
+
+[[ $(uname -s) == Darwin ]] || { echo "macos:download requires macOS and Xcode" >&2; exit 1; }
+
+target="$PWD/target"
+out="$target/download"
+app="$out/re5OSX.app"
+kit="$app/Contents/Resources/kit"
+
+# The app without the game, as a static library, and the native libraries it needs.
+flags=$(RE5OSX_GAME_LINK=external cargo rustc -p re5osx-app --release --crate-type staticlib -- --print native-static-libs 2>&1 |
+    sed -n 's/.*native-static-libs: //p' | tail -1)
+[ -n "$flags" ] || { echo "no native-static-libs from cargo" >&2; exit 1; }
+RE5OSX_GAME_LINK=external cargo build -p re5osx-gamec -p re5osx-launcher --release
+
+# Icons (Icon Composer source), as macos:build makes them.
+assets="$target/package/macos-assets"
+mkdir -p "$assets"
+xcrun actool platform/shared/re5OSX.icon --compile "$assets" \
+    --platform macosx --minimum-deployment-target 14.0 --app-icon re5OSX \
+    --output-partial-info-plist "$assets/Info.plist" --output-format human-readable-text >/dev/null
+
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$kit/crates/re5osx-game" "$kit/third_party/wabt/third_party/simde" "$kit/wabt-src/wasm2c"
+
+# The kit: link-app and what it needs.
+cp platform/macos/link-app "$target/release/re5osx-gamec" "$target/re5osx-tools/bin/wasm2c" "$target/re5osx-tools/wasm2c.stamp" "$kit/"
+cp "$target/release/libre5osx_app.a" "$kit/"
+echo "$flags" > "$kit/link-flags"
+cp -R crates/re5osx-game/csrc "$kit/crates/re5osx-game/"
+cp -R third_party/wabt/third_party/simde/simde "$kit/third_party/wabt/third_party/simde/"
+cp "$target"/re5osx-tools/wabt-src/wasm2c/*.{c,h,inc} "$kit/wabt-src/wasm2c/"
+cp "$assets/re5OSX.icns" "$assets/Assets.car" "$kit/"
+# re5OSX's Info.plist: cargo-packager's keys and platform/macos/Info.plist's.
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+sed -e "s/@VERSION@/$version/g" platform/macos/native.plist > "$kit/Info.plist"
+
+# The launcher.
+cp "$target/release/re5OSX" "$app/Contents/MacOS/re5OSX"
+cp -R crates/re5osx-launcher/web "$app/Contents/Resources/web"
+cp "$assets/re5OSX.icns" "$assets/Assets.car" "$app/Contents/Resources/"
+sed -e "s/@VERSION@/$version/g" platform/macos/launcher.plist > "$app/Contents/Info.plist"
+codesign --force --deep --sign - "$app"
+
+# The DMG: the app and a link to Applications.
+rm -f "$out/re5OSX.dmg"
+stage="$out/dmg"
+rm -rf "$stage" && mkdir -p "$stage"
+cp -R "$app" "$stage/"
+ln -s /Applications "$stage/Applications"
+hdiutil create -volname re5OSX -srcfolder "$stage" -format UDZO -ov "$out/re5OSX.dmg" >/dev/null 2>&1
+rm -rf "$stage"
+echo "built $app and $out/re5OSX.dmg ($(du -h "$out/re5OSX.dmg" | cut -f1))"

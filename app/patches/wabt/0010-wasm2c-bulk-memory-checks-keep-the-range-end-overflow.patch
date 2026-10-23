@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Tue, 20 Oct 2026 15:30:00 +0200
+Subject: [PATCH 10/10] wasm2c: bulk memory checks keep the range end's overflow
+
+With WASM_RT_NONCONFORMING_SKIP_BOUNDS_CHECKS, checked_add_u64 is a plain
+(wrapping) add, and RANGE_CHECK used it: memory.copy or memory.fill with
+an address just below 2^64 or a huge length wrapped past the check and
+wrote outside the memory (memcpy and memset are these operations). The
+check now compares without the addition; it only runs on bulk memory and
+table operations, so it costs nothing measurable.
+---
+ src/template/wasm2c.declarations.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/template/wasm2c.declarations.c b/src/template/wasm2c.declarations.c
+index ef3176c..ba530b0 100644
+--- a/src/template/wasm2c.declarations.c
++++ b/src/template/wasm2c.declarations.c
+@@ -175,12 +175,23 @@ static inline uint64_t checked_add_u64(uint64_t a, uint64_t b) {
+ }
+ #endif
+ 
++#if WASM_RT_NONCONFORMING_SKIP_BOUNDS_CHECKS
++// checked_add_u64 wraps in this mode: the end of a range is compared without
++// an addition that could (a huge length, an address below zero).
++#define RANGE_CHECK(mem, offset, len)                          \
++  do {                                                         \
++    uint64_t size_ = (mem)->size, len_ = (uint64_t)(len);      \
++    if (UNLIKELY(len_ > size_ || (uint64_t)(offset) > size_ - len_)) \
++      TRAP(OOB);                                               \
++  } while (0);
++#else
+ #define RANGE_CHECK(mem, offset, len)            \
+   do {                                           \
+     uint64_t res = checked_add_u64(offset, len); \
+     if (UNLIKELY(res > (mem)->size))             \
+       TRAP(OOB);                                 \
+   } while (0);
++#endif
+ 
+ #if WASM_RT_USE_SEGUE_FOR_THIS_MODULE && WASM_RT_SANITY_CHECKS
+ #include <stdio.h>

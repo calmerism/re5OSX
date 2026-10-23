@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Open the built macOS app without rebuilding"
+#USAGE arg "[args]..." var=#true help="Passed to the app (e.g. --play, an absolute game directory)"
+set -euo pipefail
+app="$PWD/target/package/re5OSX.app"
+[ -d "$app" ] || { echo "app not found: run mise run macos:build first" >&2; exit 1; }
+exec open "$app" --args "$@"

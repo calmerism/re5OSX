@@ -1,0 +1,36 @@
+From 53dd4fcf0a1597bc18db1edfcca49e403fbe5fe2 Mon Sep 17 00:00:00 2001
+From: re5osx <re5osx@localhost>
+Date: Mon, 12 Oct 2026 21:44:04 +0200
+Subject: [PATCH 7/7] wasm2c: on Windows with Clang, inline floating-point
+ classification
+
+MSVC's math.h implements isnan, isinf and signbit as calls into the CRT
+(_fdclass, _dclass, _fdsign, ...), which the generated code makes on the
+NaN checks of every float-to-int conversion and min/max: in a profile of
+a game they took 4-6 % of the threads doing float work. Compiled with
+Clang (clang-cl) against those headers, the builtins classify inline, as
+math.h does elsewhere.
+---
+ src/template/wasm2c.includes.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/template/wasm2c.includes.c b/src/template/wasm2c.includes.c
+index bc5a1c9..eb3cc6b 100644
+--- a/src/template/wasm2c.includes.c
++++ b/src/template/wasm2c.includes.c
+@@ -14,3 +14,15 @@
+ #else
+ #include <alloca.h>
+ #endif
++
++#if defined(_MSC_VER) && defined(__clang__)
++// MSVC's math.h classifies floating-point values through calls into the CRT
++// (_fdclass, _dsign, ...): every NaN check of a float-to-int conversion or a
++// min/max would be one. Clang's builtins are a few instructions, inline.
++#undef isnan
++#define isnan(x) __builtin_isnan(x)
++#undef isinf
++#define isinf(x) __builtin_isinf(x)
++#undef signbit
++#define signbit(x) __builtin_signbit(x)
++#endif

@@ -1,0 +1,337 @@
+//! The application's performance overlay (Settings › Video › Performance
+//! overlay: re5OSX), over the game in a corner of the safe area: the frame
+//! rate, the last frames' times as a graph (bars: present to present, the
+//! line: the GPU's), where a frame's time goes (the engine's main thread,
+//! the renderer's thread, the GPU), and at full detail the busiest threads,
+//! the renderer's counts, the resolution and memory.
+//!
+//! It costs little: the renderer gathers its figures only while it shows
+//! (re5osx_gpu::perf), the overlay is redrawn 20 times a second (its one
+//! line 4 times), its numbers change 4 times a second and the threads are
+//! read once a second.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use egui::{Align2, Color32, FontId, Id, LayerId, Order, Pos2, Rect, Shape, Stroke, pos2, vec2};
+use re5osx_gpu::perf::Snapshot;
+
+use super::Status;
+use crate::settings::{Corner, OverlayDetail, Settings, Upscaling};
+
+const REDRAW: Duration = Duration::from_millis(50);
+const FIGURES: Duration = Duration::from_millis(250);
+const THREADS: Duration = Duration::from_secs(1);
+/// Threads listed at full detail.
+const BUSIEST: usize = 6;
+
+const BACKGROUND: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 160);
+const TEXT: Color32 = Color32::from_rgb(232, 232, 227);
+const MUTED: Color32 = Color32::from_rgb(169, 168, 160);
+const GOOD: Color32 = Color32::from_rgb(151, 196, 89);
+const SLOW: Color32 = Color32::from_rgb(239, 159, 39);
+const BAD: Color32 = Color32::from_rgb(240, 149, 149);
+const GPU: Color32 = Color32::from_rgb(133, 183, 235);
+const BAR: Color32 = Color32::from_rgb(93, 202, 165);
+const TRACK: Color32 = Color32::from_rgba_premultiplied(30, 30, 30, 30);
+const RULE: Color32 = Color32::from_rgba_premultiplied(40, 40, 40, 40);
+
+const FONT: f32 = 11.0;
+const ROW: f32 = 14.0;
+const PAD: f32 = 6.0;
+const GRAPH: f32 = 40.0;
+/// From the safe area's edges.
+const MARGIN: f32 = 8.0;
+
+#[derive(Default)]
+pub(super) struct PerfHud {
+    drawn_at: Option<Instant>,
+    figures: Figures,
+    figures_at: Option<Instant>,
+    threads: Threads,
+}
+
+/// The numbers shown, held between their updates.
+#[derive(Default)]
+struct Figures {
+    /// Mean frame time over the last quarter of the graph, and the longest
+    /// in it all.
+    frame: Option<f32>,
+    longest: f32,
+    render: Option<f32>,
+    gpu: Option<f32>,
+    draws: u32,
+    passes: u32,
+    submits: u32,
+    gpu_bytes: u64,
+}
+
+#[derive(Default)]
+struct Threads {
+    /// CPU time so far, by thread.
+    last: HashMap<u64, Duration>,
+    at: Option<Instant>,
+    /// The busiest, with their share of a core (percent).
+    busiest: Vec<(String, f32)>,
+    /// The engine's main thread's share.
+    main: Option<f32>,
+    footprint: Option<u64>,
+}
+
+impl Threads {
+    fn sample(&mut self) {
+        let now = Instant::now();
+        let threads = re5osx_runtime::cpu::threads();
+        let wall = self.at.map(|t| now - t);
+        let mut shares: Vec<(String, f32)> = Vec::new();
+        let mut last = HashMap::with_capacity(threads.len());
+        self.main = None;
+        for t in threads {
+            if let (Some(wall), Some(before)) = (wall, self.last.get(&t.id)) {
+                let share = t.cpu.saturating_sub(*before).as_secs_f32() / wall.as_secs_f32().max(0.001) * 100.0;
+                if t.name == "engine main" {
+                    self.main = Some(share);
+                }
+                let name = match t.name.strip_prefix("[RAGE] ") {
+                    _ if t.name.is_empty() => "(unnamed)".to_owned(),
+                    Some(rest) => rest.to_owned(),
+                    None => t.name,
+                };
+                shares.push((name, share));
+            }
+            last.insert(t.id, t.cpu);
+        }
+        shares.sort_by(|a, b| b.1.total_cmp(&a.1));
+        shares.truncate(BUSIEST);
+        self.busiest = shares;
+        self.last = last;
+        self.at = Some(now);
+        self.footprint = re5osx_runtime::memory::footprint().0;
+    }
+}
+
+impl PerfHud {
+    /// Whether it is time to draw it again (when nothing else is drawn):
+    /// for the graph's sake, or (one line) when its numbers change.
+    pub(super) fn due(&self, detail: OverlayDetail) -> bool {
+        let every = if detail == OverlayDetail::Minimal { FIGURES } else { REDRAW };
+        self.drawn_at.is_none_or(|t| t.elapsed() >= every)
+    }
+
+    /// Not shown: the next showing starts its figures afresh.
+    pub(super) fn hide(&mut self) {
+        *self = PerfHud::default();
+    }
+
+    /// Draws the overlay; returns where (what else is drawn keeps off it).
+    pub(super) fn draw(&mut self, ctx: &egui::Context, safe: Rect, settings: &Settings, status: &Status) -> Rect {
+        let now = Instant::now();
+        self.drawn_at = Some(now);
+        let snapshot = re5osx_gpu::perf::snapshot();
+        if self.figures_at.is_none_or(|t| now - t >= FIGURES) {
+            self.figures_at = Some(now);
+            self.figures = figures(&snapshot);
+        }
+        let detail = settings.overlay_detail;
+        if detail != OverlayDetail::Minimal && self.threads.at.is_none_or(|t| now - t >= THREADS) {
+            self.threads.sample();
+        }
+        // The frame time aimed at: the frame rate's limit, else the display's.
+        let budget = 1000.0 / if settings.max_fps > 0 { settings.max_fps as f32 } else { status.refresh_rate.max(1.0) };
+        let painter = ctx.layer_painter(LayerId::new(Order::Middle, Id::new("performance overlay")));
+        let font = FontId::monospace(FONT);
+        let f = &self.figures;
+
+        if detail == OverlayDetail::Minimal {
+            let mut job = egui::text::LayoutJob::default();
+            let mut add = |text: &str, color| job.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
+            match f.frame {
+                Some(ms) => {
+                    add(&format!("{:.0} fps", 1000.0 / ms), pace(ms, budget));
+                    add(&format!(" · {ms:.1} ms"), TEXT);
+                }
+                None => add("– fps", MUTED),
+            }
+            if let Some(gpu) = f.gpu {
+                add(&format!(" · GPU {gpu:.1}"), TEXT);
+            }
+            let galley = painter.layout_job(job);
+            let rect = place(safe, settings.overlay_corner, galley.size() + vec2(PAD * 2.0, PAD * 1.4));
+            painter.rect_filled(rect, 5.0, BACKGROUND);
+            painter.galley(rect.min + vec2(PAD, PAD * 0.7), galley, TEXT);
+            return rect;
+        }
+
+        let full = detail == OverlayDetail::Full;
+        let width = if full { 228.0 } else { 204.0 };
+        // Where a frame's time goes: the engine's main thread, the renderer's
+        // thread, the GPU.
+        let main = self.threads.main.zip(f.frame).map(|(share, ms)| share / 100.0 * ms);
+        let costs = [("main", main, TEXT), ("render", f.render, TEXT), ("gpu", f.gpu, GPU)];
+        let costs: Vec<_> = costs.into_iter().filter_map(|(l, ms, c)| ms.map(|ms| (l, ms, c))).collect();
+        let bound = costs.iter().map(|c| c.1).fold(0.0, f32::max);
+        let threads = if full { self.threads.busiest.len() } else { 0 };
+        let mut height = PAD * 2.0 + 18.0 + GRAPH + 6.0 + ROW * (1 + costs.len()) as f32;
+        let (w, h) = status.window;
+        let scaled = status.back_buffer.filter(|&b| b != (w, h));
+        if full {
+            height += 7.0 + ROW * threads as f32 + 7.0 + ROW * (3 + scaled.is_some() as usize) as f32;
+        }
+        let rect = place(safe, settings.overlay_corner, vec2(width, height));
+        painter.rect_filled(rect, 6.0, BACKGROUND);
+        let (left, right) = (rect.min.x + PAD, rect.max.x - PAD);
+        let mut y = rect.min.y + PAD;
+
+        // The frame rate, and what it aims at.
+        let fps = f.frame.map_or("–".into(), |ms| format!("{:.0}", 1000.0 / ms));
+        let color = f.frame.map_or(MUTED, |ms| pace(ms, budget));
+        let at = painter.text(pos2(left, y), Align2::LEFT_TOP, fps, FontId::monospace(15.0), color);
+        painter.text(pos2(at.max.x + 4.0, y + 4.0), Align2::LEFT_TOP, "fps", font.clone(), MUTED);
+        let aim = if settings.max_fps > 0 {
+            format!("{} max", settings.max_fps)
+        } else {
+            format!("{:.0} Hz", status.refresh_rate)
+        };
+        painter.text(pos2(right, y + 4.0), Align2::RIGHT_TOP, aim, font.clone(), MUTED);
+        y += 18.0;
+
+        graph(&painter, Rect::from_min_max(pos2(left, y + 2.0), pos2(right, y + 2.0 + GRAPH)), &snapshot, budget);
+        y += GRAPH + 6.0;
+
+        let row = |y: f32, label: &str, value: String, color: Color32| {
+            painter.text(pos2(left, y), Align2::LEFT_TOP, label, font.clone(), MUTED);
+            painter.text(pos2(right, y), Align2::RIGHT_TOP, value, font.clone(), color);
+        };
+        let frame = f.frame.map_or("–".into(), |ms| format!("{ms:.1} ms  max {:.1}", f.longest));
+        row(y, "frame", frame, TEXT);
+        y += ROW;
+        for (label, ms, color) in &costs {
+            // The one a frame waits on, when it takes most of the frame.
+            let limits = *ms == bound && f.frame.is_some_and(|frame| *ms >= frame * 0.8);
+            row(y, label, format!("{ms:.1} ms"), if limits { SLOW } else { *color });
+            y += ROW;
+        }
+        if !full {
+            return rect;
+        }
+
+        let rule = |y: f32| painter.hline(left..=right, y + 3.0, Stroke::new(0.5, RULE));
+        rule(y);
+        y += 7.0;
+        let name_width = 96.0;
+        for (name, share) in &self.threads.busiest {
+            let name: String = name.chars().take(13).collect();
+            painter.text(pos2(left, y), Align2::LEFT_TOP, name, font.clone(), TEXT);
+            painter.text(pos2(right, y), Align2::RIGHT_TOP, format!("{share:.0}%"), font.clone(), TEXT);
+            let track = Rect::from_min_max(pos2(left + name_width, y + 4.0), pos2(right - 34.0, y + 9.0));
+            painter.rect_filled(track, 2.0, TRACK);
+            let filled = track.width() * (share / 100.0).clamp(0.0, 1.0);
+            let color = if *share > 85.0 { SLOW } else { BAR };
+            painter.rect_filled(Rect::from_min_size(track.min, vec2(filled, track.height())), 2.0, color);
+            y += ROW;
+        }
+        rule(y);
+        y += 7.0;
+        row(y, "draws", format!("{} · {} passes · {} sub", f.draws, f.passes, f.submits), TEXT);
+        y += ROW;
+        match scaled {
+            Some((bw, bh)) => {
+                row(y, "res", format!("{bw}×{bh} → {w}×{h}"), TEXT);
+                y += ROW;
+                row(y, "upscaler", upscaler(settings.upscaler).into(), TEXT);
+            }
+            None => row(y, "res", format!("{w}×{h}"), TEXT),
+        }
+        y += ROW;
+        let gb = |bytes: u64| format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64);
+        let memory = match self.threads.footprint {
+            Some(used) => format!("{} · gpu {}", gb(used), gb(f.gpu_bytes)),
+            None => format!("gpu {}", gb(f.gpu_bytes)),
+        };
+        row(y, "mem", memory, TEXT);
+        rect
+    }
+}
+
+fn figures(s: &Snapshot) -> Figures {
+    // The last quarter of the graph: about half a second.
+    let recent = |v: &[f32]| {
+        let tail = &v[v.len().saturating_sub(re5osx_gpu::perf::FRAMES / 4)..];
+        (!tail.is_empty()).then(|| tail.iter().sum::<f32>() / tail.len() as f32)
+    };
+    Figures {
+        frame: recent(&s.frame_ms),
+        longest: s.frame_ms.iter().copied().fold(0.0, f32::max),
+        render: recent(&s.render_ms),
+        gpu: recent(&s.gpu_ms),
+        draws: s.draws,
+        passes: s.passes,
+        submits: s.submits,
+        gpu_bytes: s.gpu_bytes,
+    }
+}
+
+/// How a frame time compares with the one aimed at.
+fn pace(ms: f32, budget: f32) -> Color32 {
+    if ms <= budget * 1.2 {
+        GOOD
+    } else if ms <= budget * 2.0 {
+        SLOW
+    } else {
+        BAD
+    }
+}
+
+/// A box of `size` in `corner` of the safe area.
+fn place(safe: Rect, corner: Corner, size: egui::Vec2) -> Rect {
+    let inner = safe.shrink(MARGIN);
+    let x = match corner {
+        Corner::TopLeft | Corner::BottomLeft => inner.min.x,
+        Corner::TopRight | Corner::BottomRight => inner.max.x - size.x,
+    };
+    let y = match corner {
+        Corner::TopLeft | Corner::TopRight => inner.min.y,
+        Corner::BottomLeft | Corner::BottomRight => inner.max.y - size.y,
+    };
+    Rect::from_min_size(pos2(x, y), size)
+}
+
+/// The frames as bars (coloured by pace) under lines at the budget and
+/// twice it, the GPU's times as a line over them.
+fn graph(painter: &egui::Painter, rect: Rect, s: &Snapshot, budget: f32) {
+    let top = (budget * 3.0).min(100.0);
+    let y_of = |ms: f32| rect.max.y - (ms / top).clamp(0.0, 1.0) * rect.height();
+    let step = rect.width() / re5osx_gpu::perf::FRAMES as f32;
+    // The newest frame at the right edge.
+    let x_of = |i: usize, n: usize| rect.max.x - (n - i) as f32 * step;
+    let n = s.frame_ms.len();
+    for (i, &ms) in s.frame_ms.iter().enumerate() {
+        let x = x_of(i, n);
+        let bar = Rect::from_min_max(pos2(x, y_of(ms)), pos2(x + (step - 0.5).max(0.5), rect.max.y));
+        painter.rect_filled(bar, 0.0, pace(ms, budget));
+    }
+    for ms in [budget, budget * 2.0] {
+        let y = y_of(ms);
+        painter.extend(Shape::dashed_line(
+            &[pos2(rect.min.x, y), pos2(rect.max.x, y)],
+            Stroke::new(0.5, RULE),
+            2.0,
+            2.0,
+        ));
+    }
+    let n = s.gpu_ms.len();
+    if n >= 2 {
+        let points: Vec<Pos2> =
+            s.gpu_ms.iter().enumerate().map(|(i, &ms)| pos2(x_of(i, n) + step / 2.0, y_of(ms))).collect();
+        painter.add(Shape::line(points, Stroke::new(1.0, GPU)));
+    }
+}
+
+fn upscaler(u: Upscaling) -> &'static str {
+    match u {
+        Upscaling::Bicubic => "bicubic",
+        Upscaling::MetalFx => "MetalFX",
+        Upscaling::MetalFxTemporal => "MetalFX Temporal",
+        Upscaling::Fsr => "FSR 2",
+    }
+}

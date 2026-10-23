@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>re5OSX</title>
+<link rel="icon" href="favicon.png">
+<style>
+/* The game app's own look (crates/re5osx/src/ui): black, its wordmark,
+   Barlow Condensed headings in capitals, Barlow text, square white buttons,
+   a gold rail, amber for problems. */
+@font-face { font-family: Barlow; src: url(fonts/Barlow-SemiBold.ttf); font-weight: 600; }
+@font-face { font-family: "Barlow Condensed"; src: url(fonts/BarlowCondensed-Bold.ttf); font-weight: 700; }
+:root {
+	--ink: #0a0a0a;
+	--muted: #b0b0b0;
+	--dim: #6e6e6e;
+	--gold: #fcc419;
+	--warn: #f0b464;
+	--line: #3c3c3c;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; overflow: hidden; }
+body {
+	background: #000; color: #fff;
+	font: 600 15px/1.45 Barlow, -apple-system, sans-serif;
+	-webkit-font-smoothing: antialiased;
+	-webkit-user-select: none; user-select: none; cursor: default;
+}
+
+/* The title bar is the page's own (the window's is transparent): it drags the window. */
+#drag { position: fixed; top: 0; left: 0; right: 0; height: 40px; z-index: 2; }
+
+/* One column, 300 points wide: the wordmark, the heading, a line of text,
+   then the controls, each block the same distance from the next. */
+main {
+	position: fixed; inset: 40px 0 44px; padding: 0 40px;
+	display: flex; flex-direction: column; align-items: center; justify-content: center;
+	text-align: center;
+	--column: 300px;
+	--gap: 24px;
+}
+.wordmark { height: 28px; margin: 0 0 14px; -webkit-user-drag: none; }
+h1 {
+	font: 700 40px/1 "Barlow Condensed", sans-serif; text-transform: uppercase;
+	margin: 0 0 var(--gap); letter-spacing: .005em;
+}
+.about { width: var(--column); color: var(--muted); font-size: 14px; line-height: 1.5; margin: 0 0 var(--gap); }
+.about:empty { display: none; }
+
+/* The game app's button: white, square, its label in condensed capitals. */
+.button {
+	font: 700 17px/1 "Barlow Condensed", sans-serif; text-transform: uppercase; letter-spacing: .02em;
+	color: var(--ink); background: #fff; border: 0; border-radius: 0;
+	width: var(--column); height: 40px; padding: 0 16px; cursor: default;
+}
+.button:hover, .button:focus-visible { outline: none; box-shadow: inset 0 0 0 2px #969696; }
+.button:active { background: #e2e2e2; }
+
+.or { margin-top: 10px; width: var(--column); }
+.or input {
+	width: 100%; height: 40px; padding: 0 12px; text-align: center;
+	font: 600 14px Barlow, sans-serif; color: #fff;
+	background: #000; border: 1px solid var(--line); border-radius: 0;
+	-webkit-user-select: text; user-select: text;
+}
+.or input:focus { outline: none; border-color: #fff; }
+.or input::placeholder { color: var(--dim); }
+
+.progress { width: var(--column); }
+.rail { height: 5px; background: rgba(255, 255, 255, .16); overflow: hidden; }
+.rail div { height: 100%; width: 0; background: var(--gold); transition: width .6s ease; }
+.rail.busy div { width: 30%; animation: busy 1.4s ease-in-out infinite; }
+@keyframes busy { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+.step {
+	display: flex; justify-content: space-between; gap: 12px; margin-top: 10px;
+	color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; min-height: 19px;
+}
+.step b { font: 700 15px/1.2 "Barlow Condensed", sans-serif; color: var(--gold); }
+
+.error {
+	margin-top: 16px; width: var(--column); color: var(--warn); font-size: 13px; line-height: 1.45;
+	white-space: pre-wrap; -webkit-user-select: text; user-select: text;
+}
+
+/* The game folder, at the bottom. */
+footer {
+	position: fixed; left: 0; right: 0; bottom: 0; height: 44px;
+	display: flex; align-items: center; justify-content: center; gap: 10px;
+	padding: 0 24px; font-size: 12px; color: var(--dim);
+}
+footer .where { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; max-width: 260px; }
+footer button {
+	background: none; border: 0; padding: 2px 0; cursor: default;
+	font: 600 12px Barlow, sans-serif; color: var(--muted);
+}
+footer button:hover, footer button:focus-visible { color: #fff; outline: none; }
+
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="drag"></div>
+<main>
+	<img class="wordmark" src="logo.png" alt="re5OSX">
+	<h1 id="title"></h1>
+	<p class="about" id="about"></p>
+	<div class="progress" id="progress" hidden>
+		<div class="rail" id="rail"><div id="done"></div></div>
+		<div class="step"><span id="step"></span><b id="percent"></b></div>
+	</div>
+	<button class="button" id="action" hidden></button>
+	<form class="or" id="or" hidden><input id="path" placeholder="or paste the folder's path" spellcheck="false"></form>
+	<div class="error" id="error" hidden></div>
+</main>
+<footer id="footer" hidden>
+	<span class="where" id="where"></span>
+	<button id="change">Change folder</button>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let info = null, changing = false, action = null, chooseError = '';
+
+async function api(path, body) {
+	const r = await fetch(path, body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) });
+	const value = await r.json().catch(() => ({}));
+	if (!r.ok && value.error) throw new Error(value.error);
+	return value;
+}
+
+// progress: null (none), 'busy' (no measure yet) or 0 to 1
+function screen({ title, about = '', button = null, or = false, progress = null, step = '', error = '' }) {
+	$('title').textContent = title;
+	$('about').textContent = about;
+	action = button && button.run;
+	$('action').hidden = !button;
+	if (button) $('action').textContent = button.label;
+	$('or').hidden = !or;
+	$('progress').hidden = progress === null;
+	$('rail').classList.toggle('busy', progress === 'busy');
+	$('done').style.width = typeof progress === 'number' ? progress * 100 + '%' : '';
+	$('percent').textContent = typeof progress === 'number' && progress > 0 ? Math.round(progress * 100) + '%' : '';
+	$('step').textContent = step;
+	$('error').hidden = !error;
+	$('error').textContent = error;
+}
+
+function render() {
+	if (!info) return;
+	const game = info.game, job = info.install || {}, setup = game.setup || {};
+	const installing = job.state === 'running', setting = setup.state === 'running';
+	$('footer').hidden = !game.ok || changing || installing || setting;
+	// (Cut from its start when long; the mark keeps its slashes in place.)
+	$('where').textContent = game.path ? '‎' + game.path : '';
+
+	if (!game.ok || changing) {
+		return screen({
+			title: 'Find your game',
+			about: 'Choose the folder where your GTA V web build is saved.',
+			button: { label: 'Choose folder', run: () => choose() },
+			or: true,
+			error: chooseError,
+		});
+	}
+	if (setting || setup.state === 'failed' || !game.ready) {
+		if (setup.state === 'idle' || setup.state === 'done') api('/__re5osx/setup', {}).catch(() => {});
+		return screen({
+			title: 'Setting up',
+			about: 'Making the menu sounds and pictures from your game. This takes a minute.',
+			progress: setup.state === 'failed' ? null : 'busy',
+			step: (setup.log || []).slice(-1)[0] || 'Starting',
+			button: setup.state === 'failed' ? { label: 'Try again', run: () => api('/__re5osx/setup', {}).then(refresh) } : null,
+			error: setup.error || '',
+		});
+	}
+	if (installing || job.state === 'done') {
+		return screen({
+			title: job.state === 'done' ? 'Starting' : 'Installing',
+			about: job.state === 'done' ? '' : 'About 7 minutes. You only do this once.',
+			progress: job.progress || 0,
+			step: job.step || '',
+		});
+	}
+	if (info.made) {
+		return screen({
+			title: 'Ready',
+			button: { label: 'Play', run: () => api('/__re5osx/play', {}).catch((e) => screen({ title: 'Ready', error: e.message })) },
+		});
+	}
+	return screen({
+		title: 'Install',
+		about: 're5OSX builds the game for your Mac from your own copy. It takes about 7 minutes, once.',
+		button: { label: job.state === 'failed' ? 'Try again' : 'Install', run: install },
+		error: job.state === 'failed' ? job.error || 'The build stopped.' : '',
+	});
+}
+
+async function refresh() {
+	try { info = await api('/__re5osx/info'); } catch (_) { return; }
+	render();
+}
+
+async function choose(path) {
+	chooseError = '';
+	const r = path === undefined ? await api('/__re5osx/choose', {}) : await api('/__re5osx/game', { path });
+	if (r.cancelled) return;
+	if (!r.ok) {
+		chooseError = 'That folder doesn’t have the game in it. Missing: ' + (r.missing || []).join(', ');
+		return render();
+	}
+	changing = false;
+	refresh();
+}
+
+async function install() {
+	try { info.install = await api('/__re5osx/install', {}); } catch (e) { info.install = { state: 'failed', error: e.message }; }
+	render();
+}
+
+$('action').onclick = () => action && action();
+$('or').onsubmit = (e) => { e.preventDefault(); if ($('path').value.trim()) choose($('path').value.trim()); };
+$('change').onclick = () => { changing = true; render(); };
+document.addEventListener('keydown', (e) => {
+	if (e.key === 'Enter' && document.activeElement.tagName !== 'INPUT' && action) action();
+	if (e.key === 'Escape' && changing && info && info.game.ok) { changing = false; render(); }
+});
+$('drag').addEventListener('mousedown', (e) => { if (e.button === 0 && window.ipc) window.ipc.postMessage('drag'); });
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

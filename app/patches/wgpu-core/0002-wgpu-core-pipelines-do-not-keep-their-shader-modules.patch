@@ -1,0 +1,85 @@
+From dbe3a02687abf7704d294059f9e1a1b971e1f89b Mon Sep 17 00:00:00 2001
+From: mempage4k <mempage4k@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 01:04:22 +0200
+Subject: [PATCH 2/2] wgpu-core: pipelines do not keep their shader modules
+ alive
+
+The Metal and Vulkan HALs are done with a shader module once a pipeline
+exists, but keep its naga IR for as long as the module lives: ~470 KB
+for each of the game's translated shaders, hundreds of MB in all. With
+pipelines no longer holding them, modules go when their owner drops them.
+
+---
+ src/device/resource.rs | 28 ++++++++++------------------
+ src/pipeline.rs        |  2 +-
+ 2 files changed, 11 insertions(+), 19 deletions(-)
+
+diff --git a/src/device/resource.rs b/src/device/resource.rs
+index 2e09f25..4fec1ae 100644
+--- a/src/device/resource.rs
++++ b/src/device/resource.rs
+@@ -4155,7 +4155,11 @@ impl Device {
+             state: ResourceState::Valid(pipeline::ComputePipelineState {
+                 raw: ManuallyDrop::new(raw),
+                 layout: pipeline_layout.clone(),
+-                _shader_module: shader_module,
++                // re5osx: see `create_render_pipeline`.
++                _shader_module: {
++                    drop(shader_module);
++                    None
++                },
+             }),
+             device: self.clone(),
+             late_sized_buffer_groups,
+@@ -5038,22 +5042,6 @@ impl Device {
+                 flags |= pipeline::PipelineFlags::WRITES_STENCIL;
+             }
+         }
+-        let shader_modules = {
+-            let mut shader_modules = ArrayVec::new();
+-            match desc.vertex {
+-                pipeline::RenderPipelineVertexProcessor::Vertex(vertex) => {
+-                    shader_modules.push(vertex.stage.module)
+-                }
+-                pipeline::RenderPipelineVertexProcessor::Mesh(task, mesh) => {
+-                    if let Some(task) = task {
+-                        shader_modules.push(task.stage.module);
+-                    }
+-                    shader_modules.push(mesh.stage.module);
+-                }
+-            }
+-            shader_modules.extend(desc.fragment.map(|f| f.stage.module));
+-            shader_modules
+-        };
+ 
+         let pipeline = pipeline::RenderPipeline {
+             state: ResourceState::Valid(pipeline::RenderPipelineState {
+@@ -5062,7 +5050,11 @@ impl Device {
+             }),
+             device: self.clone(),
+             pass_context,
+-            _shader_modules: shader_modules,
++            // re5osx: pipelines do not keep their shader modules alive. The
++            // Metal and Vulkan HALs are done with a module once the pipeline
++            // exists, but keep its naga IR (hundreds of KB for large
++            // shaders) for as long as the module lives.
++            _shader_modules: ArrayVec::new(),
+             flags,
+             topology: desc.primitive.topology,
+             strip_index_format: desc.primitive.strip_index_format,
+diff --git a/src/pipeline.rs b/src/pipeline.rs
+index 710a7ea..d915605 100644
+--- a/src/pipeline.rs
++++ b/src/pipeline.rs
+@@ -304,7 +304,7 @@ impl WebGpuError for CreateComputePipelineError {
+ pub struct ComputePipelineState {
+     pub(crate) raw: ManuallyDrop<Box<dyn hal::DynComputePipeline>>,
+     pub(crate) layout: Arc<PipelineLayout>,
+-    pub(crate) _shader_module: Arc<ShaderModule>,
++    pub(crate) _shader_module: Option<Arc<ShaderModule>>,
+ }
+ 
+ #[derive(Debug)]
+-- 
+2.50.1 (Apple Git-155)
+

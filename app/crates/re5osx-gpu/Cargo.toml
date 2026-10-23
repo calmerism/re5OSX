@@ -1,0 +1,44 @@
+[package]
+name = "re5osx-gpu"
+description = "The renderer: executes the engine's D3D11-style command ring with wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+re5osx-runtime.workspace = true
+anyhow.workspace = true
+log.workspace = true
+arrayvec = "0.7"
+bcdec_rs = "0.2"
+ctt-etcpak = "0.6"
+bytemuck = "1"
+# 16-bit normalized texels kept as half floats where the GPU lacks the former.
+half = "2"
+# Shader text kept compressed (see shader::Wgsl).
+lz4_flex = "0.11"
+# AMD FSR 2 upscaler, ported to Rust and WGSL, with a wgpu backend.
+sp-fidelity = "0.2"
+sp-fidelity-wgpu = "0.2"
+egui.workspace = true
+egui-wgpu.workspace = true
+png = "0.18"
+pollster = "0.4"
+regex = "1"
+rustc-hash = "2"
+serde_json.workspace = true
+# Metal on Apple platforms, Vulkan elsewhere (Windows included).
+wgpu = { workspace = true, features = ["std", "parking_lot", "metal", "vulkan", "wgsl"] }
+
+# MetalFX upscaling and paced presenting, through the Metal objects wgpu uses.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDictionary", "NSString"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "MTLCommandBuffer", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLPixelFormat", "MTLResource", "MTLTexture"] }
+objc2-metal-fx = { version = "0.3", default-features = false, features = ["std", "MTLFXSpatialScaler", "MTLFXTemporalScaler", "MTLFXFrameInterpolator"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "objc2-metal", "CALayer", "CAMetalLayer"] }
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
